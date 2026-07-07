@@ -5,6 +5,5 @@ from .ui import create_main_window
 
 def run_app() -> None:
     """Start the MVR Player application."""
-    window = create_main_window()
-    window.mainloop()
-
+    app_window = create_main_window()
+    app_window.run()
