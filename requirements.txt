@@ -1,0 +1,4 @@
+# Runtime dependencies for MVR Player.
+# Currently there are no external runtime dependencies.
+# Tkinter is included with most standard Python installations.
+

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mvr-player"
+version = "0.1.0"
+description = "Cross-platform Python application for viewing .mvr files and converting them to .mp4."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "MVR Player Contributors" }
+]
+dependencies = []
+
+[project.scripts]
+mvr-player = "mvr_player.main:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
