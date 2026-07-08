@@ -1,4 +1,4 @@
-"""Command-line entry point for MVR Player."""
+"""Repository-root entry point for MVR Player."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ def _maybe_reexec_local_venv() -> None:
     if os.environ.get("MVR_PLAYER_VENV_REEXEC") == "1":
         return
 
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parent.parent
     candidates = (
         project_root / ".venv" / "bin" / "python",
         project_root / ".venv" / "Scripts" / "python.exe",

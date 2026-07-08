@@ -16,7 +16,9 @@ class ImportTests(unittest.TestCase):
         from mvr_player import utils
 
         self.assertTrue(mvr_player.__version__)
+        self.assertEqual(mvr_player.__version__, "0.1.0")
         self.assertEqual(settings.APP_NAME, "MVR Player")
+        self.assertEqual(settings.APP_VERSION, "0.1.0")
         self.assertTrue(app)
         self.assertTrue(converter)
         self.assertTrue(ffmpeg_utils)

@@ -1,4 +1,2 @@
-# Runtime dependencies for MVR Player.
-# Currently there are no external runtime dependencies.
-# Tkinter is included with most standard Python installations.
-
+imageio-ffmpeg>=0.6.0
+PySide6>=6.10

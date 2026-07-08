@@ -7,12 +7,15 @@ name = "mvr-player"
 version = "0.1.0"
 description = "Cross-platform Python application for viewing .mvr files and converting them to .mp4."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
     { name = "MVR Player Contributors" }
 ]
-dependencies = []
+dependencies = [
+    "imageio-ffmpeg>=0.6.0",
+    "PySide6>=6.10"
+]
 
 [project.scripts]
 mvr-player = "mvr_player.main:main"
