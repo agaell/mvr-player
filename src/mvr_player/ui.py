@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenuBar,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QStackedLayout,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .converter import ConversionProgress, MvrConversionError, MvrConverter
 from .player import FfmpegNotFoundError, MvrPlayer, MvrPlayerError, PlayerFileError, VideoFrame
 from .settings import APP_NAME, APP_VERSION, DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE
 
@@ -56,9 +59,15 @@ class MvrPlayerMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.player = MvrPlayer()
+        self.converter = MvrConverter()
         self.selected_file: Path | None = None
         self._load_generation = 0
         self._load_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
+        self._conversion_generation = 0
+        self._conversion_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
+        self._conversion_in_progress = False
+        self._conversion_started_at = 0.0
+        self._latest_conversion_progress: ConversionProgress | None = None
         self._preview_image: QImage | None = None
         self._last_pixmap: QPixmap | None = None
         self._first_frame_seen = False
@@ -73,6 +82,10 @@ class MvrPlayerMainWindow(QMainWindow):
         self.frame_timer = QTimer(self)
         self.frame_timer.setInterval(24)
         self.frame_timer.timeout.connect(self._poll_player)
+
+        self.conversion_status_timer = QTimer(self)
+        self.conversion_status_timer.setInterval(1000)
+        self.conversion_status_timer.timeout.connect(self._refresh_conversion_status)
 
         self._configure_window()
         self._create_actions()
@@ -92,6 +105,10 @@ class MvrPlayerMainWindow(QMainWindow):
         self.open_action = QAction("Открыть MVR...", self)
         self.open_action.triggered.connect(self.open_dialog)
 
+        self.convert_action = QAction("Конвертировать в MP4...", self)
+        self.convert_action.setEnabled(False)
+        self.convert_action.triggered.connect(self._convert_to_mp4)
+
         self.exit_action = QAction("Выход", self)
         self.exit_action.triggered.connect(self.close)
 
@@ -106,6 +123,7 @@ class MvrPlayerMainWindow(QMainWindow):
 
         file_menu = menu_bar.addMenu("Файл")
         file_menu.addAction(self.open_action)
+        file_menu.addAction(self.convert_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
@@ -225,6 +243,12 @@ class MvrPlayerMainWindow(QMainWindow):
         status_bar = QStatusBar(self)
         status_bar.setObjectName("StatusBar")
         self.setStatusBar(status_bar)
+        self.conversion_progress_bar = QProgressBar(self)
+        self.conversion_progress_bar.setObjectName("ConversionProgress")
+        self.conversion_progress_bar.setFixedWidth(170)
+        self.conversion_progress_bar.setTextVisible(False)
+        self.conversion_progress_bar.hide()
+        self.statusBar().addPermanentWidget(self.conversion_progress_bar)
         self.statusBar().showMessage(f"Готово - {UI_BUILD}")
 
     def _apply_styles(self) -> None:
@@ -326,6 +350,17 @@ class MvrPlayerMainWindow(QMainWindow):
                 background: #edf2f8;
                 color: #334155;
             }
+            QProgressBar#ConversionProgress {
+                min-height: 10px;
+                max-height: 10px;
+                border: 1px solid #cbd5e1;
+                border-radius: 5px;
+                background: #dbe4ef;
+            }
+            QProgressBar#ConversionProgress::chunk {
+                border-radius: 4px;
+                background: #2563eb;
+            }
             """
         )
 
@@ -394,6 +429,8 @@ class MvrPlayerMainWindow(QMainWindow):
                 self._on_preview_ready(generation, path, preview)
             elif event_name == "error":
                 self._on_preview_error(payload)
+
+        self._pump_conversion_events()
 
     def _on_preview_ready(self, generation: int, path: Path, preview: VideoFrame) -> None:
         try:
@@ -525,14 +562,30 @@ class MvrPlayerMainWindow(QMainWindow):
         self.video_stack.setCurrentWidget(self.empty_view)
 
     def _set_file_controls_enabled(self, enabled: bool) -> None:
+        if self._conversion_in_progress:
+            self.convert_button.setEnabled(False)
+            self.convert_action.setEnabled(False)
+            self.play_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            return
+
         self.convert_button.setEnabled(enabled)
+        self.convert_action.setEnabled(enabled)
         self.play_button.setEnabled(enabled)
         self.stop_button.setEnabled(False)
 
     def _set_playback_controls(self, is_playing: bool) -> None:
+        if self._conversion_in_progress:
+            self.play_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self.convert_button.setEnabled(False)
+            self.convert_action.setEnabled(False)
+            return
+
         self.play_button.setEnabled(not is_playing and self.selected_file is not None)
         self.stop_button.setEnabled(is_playing)
         self.convert_button.setEnabled(self.selected_file is not None)
+        self.convert_action.setEnabled(self.selected_file is not None)
 
     def _handle_play_error(self, title: str, message: str) -> None:
         self._set_playback_controls(False)
@@ -544,9 +597,128 @@ class MvrPlayerMainWindow(QMainWindow):
         if self.selected_file is None:
             self.statusBar().showMessage("Сначала выберите MVR-файл")
             return
+        if self._conversion_in_progress:
+            return
 
-        self.statusBar().showMessage("Конвертация пока не реализована")
-        QMessageBox.information(self, "Конвертация", "Конвертация в MP4 пока не реализована.")
+        default_output = self.selected_file.with_suffix(".mp4")
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить MP4",
+            str(default_output),
+            "MP4-видео (*.mp4);;Все файлы (*)",
+        )
+        if not filename:
+            self.statusBar().showMessage("Сохранение MP4 отменено")
+            return
+
+        output_path = Path(filename).expanduser()
+        if output_path.suffix.lower() != ".mp4":
+            output_path = output_path.with_suffix(".mp4")
+
+        source_path = self.selected_file
+        self.stop_playback()
+        self._conversion_generation += 1
+        generation = self._conversion_generation
+        self._set_conversion_busy(True)
+        self._refresh_conversion_status()
+
+        threading.Thread(
+            target=self._convert_worker,
+            args=(generation, source_path, output_path),
+            daemon=True,
+        ).start()
+
+    def _convert_worker(self, generation: int, source_path: Path, output_path: Path) -> None:
+        def publish_progress(progress: ConversionProgress) -> None:
+            self._conversion_events.put(("progress", generation, progress))
+
+        try:
+            converted_path = self.converter.convert(
+                source_path,
+                output_path,
+                progress_callback=publish_progress,
+            )
+        except MvrConversionError as exc:
+            self._conversion_events.put(("error", generation, exc))
+            return
+
+        self._conversion_events.put(("ready", generation, converted_path))
+
+    def _pump_conversion_events(self) -> None:
+        while True:
+            try:
+                event_name, generation, payload = self._conversion_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if generation != self._conversion_generation or self._closing:
+                continue
+            if event_name == "ready":
+                self._on_conversion_ready(payload)
+            elif event_name == "error":
+                self._on_conversion_error(payload)
+            elif event_name == "progress":
+                self._on_conversion_progress(payload)
+
+    def _on_conversion_ready(self, output_path: Path) -> None:
+        self._set_conversion_busy(False)
+        self.statusBar().showMessage(f"MP4 сохранен: {output_path}")
+        QMessageBox.information(self, "Конвертация завершена", f"MP4 сохранен:\n{output_path}")
+
+    def _on_conversion_error(self, exc: object) -> None:
+        self._set_conversion_busy(False)
+        self.statusBar().showMessage("Ошибка конвертации")
+        QMessageBox.critical(self, "Не удалось сконвертировать файл", str(exc))
+
+    def _on_conversion_progress(self, progress: ConversionProgress) -> None:
+        self._latest_conversion_progress = progress
+        self._refresh_conversion_status()
+
+    def _set_conversion_busy(self, busy: bool) -> None:
+        self._conversion_in_progress = busy
+        self.open_action.setEnabled(not busy)
+        self.open_button.setEnabled(not busy)
+        self.empty_button.setEnabled(not busy)
+        self.convert_button.setText("Конвертация..." if busy else "Конвертировать в MP4")
+
+        if busy:
+            self._conversion_started_at = time.monotonic()
+            self._latest_conversion_progress = None
+            self.conversion_progress_bar.setRange(0, 0)
+            self.conversion_progress_bar.show()
+            self.conversion_status_timer.start()
+            self.convert_button.setEnabled(False)
+            self.convert_action.setEnabled(False)
+            self.play_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            return
+
+        self.conversion_status_timer.stop()
+        self.conversion_progress_bar.hide()
+        self.convert_button.setEnabled(self.selected_file is not None)
+        self.convert_action.setEnabled(self.selected_file is not None)
+        self.play_button.setEnabled(self.selected_file is not None and not self.player.is_playing())
+        self.stop_button.setEnabled(self.player.is_playing())
+
+    def _refresh_conversion_status(self) -> None:
+        if not self._conversion_in_progress:
+            return
+
+        elapsed = _format_duration(time.monotonic() - self._conversion_started_at)
+        progress = self._latest_conversion_progress
+        if progress is None:
+            self.statusBar().showMessage(f"Конвертация в MP4... прошло {elapsed}. Запуск FFmpeg")
+            return
+
+        parts = [f"прошло {elapsed}"]
+        if progress.out_time_seconds > 0:
+            parts.append(f"обработано {_format_duration(progress.out_time_seconds)} видео")
+        if progress.frame > 0:
+            parts.append(f"кадр {progress.frame}")
+        if progress.speed:
+            parts.append(f"скорость {progress.speed}")
+
+        self.statusBar().showMessage(f"Конвертация в MP4... {', '.join(parts)}")
 
     def _reset_view(self) -> None:
         if self._last_pixmap is not None:
@@ -614,6 +786,8 @@ class MvrPlayerMainWindow(QMainWindow):
         self._closing = True
         self.load_timer.stop()
         self.frame_timer.stop()
+        self.conversion_status_timer.stop()
+        self.converter.cancel()
         self.player.close()
         event.accept()
 
@@ -624,6 +798,15 @@ def _parse_geometry(value: str, fallback: tuple[int, int]) -> tuple[int, int]:
         return int(width_text), int(height_text)
     except (AttributeError, TypeError, ValueError):
         return fallback
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def create_main_window(initial_file: str | Path | None = None) -> QtMvrPlayerApp:

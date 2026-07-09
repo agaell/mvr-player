@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import queue
-import shutil
 import subprocess
 import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
+
+from .ffmpeg_utils import FfmpegLookupError, find_ffmpeg, input_args_for_file
 
 
 @dataclass(frozen=True)
@@ -231,40 +232,13 @@ class MvrPlayer:
     def _input_args(self) -> list[str]:
         if self.file_path is None:
             raise PlayerFileError("Сначала выберите MVR-файл.")
-        if self.file_path.suffix.lower() == ".mvr":
-            return ["-f", "h264", "-i", str(self.file_path)]
-        return ["-i", str(self.file_path)]
+        return input_args_for_file(self.file_path)
 
     def _find_ffmpeg(self) -> str:
-        if self.ffmpeg_path is not None:
-            configured = Path(self.ffmpeg_path).expanduser()
-            if configured.exists():
-                return str(configured)
-
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is not None:
-            return ffmpeg
-
         try:
-            import imageio_ffmpeg
-        except ImportError as exc:
-            raise FfmpegNotFoundError(
-                "FFmpeg не найден. Установите зависимости проекта командой "
-                "pip install -e . или установите FFmpeg вручную."
-            ) from exc
-
-        try:
-            bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception as exc:
-            raise FfmpegNotFoundError(
-                "Не удалось найти встроенный FFmpeg из imageio-ffmpeg."
-            ) from exc
-
-        if not Path(bundled_ffmpeg).exists():
-            raise FfmpegNotFoundError(
-                "Встроенный FFmpeg найден в настройках, но файл бинарника отсутствует."
-            )
-        return bundled_ffmpeg
+            return find_ffmpeg(self.ffmpeg_path)
+        except FfmpegLookupError as exc:
+            raise FfmpegNotFoundError(str(exc)) from exc
 
     def _refresh_process_state(self) -> None:
         process = self._process
