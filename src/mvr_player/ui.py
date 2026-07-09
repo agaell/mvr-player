@@ -128,6 +128,7 @@ class MvrPlayerMainWindow(QMainWindow):
         self._create_menu()
         self._create_layout()
         self._apply_styles()
+        self._lock_play_pause_button_width()
         self._show_empty_state()
 
     def _configure_window(self) -> None:
@@ -294,9 +295,9 @@ class MvrPlayerMainWindow(QMainWindow):
         self.play_button = QPushButton("Play", self.playback_controls)
         self.play_button.setObjectName("PrimaryButton")
         self.play_button.setEnabled(False)
-        self.play_button.clicked.connect(self.play)
+        self.play_button.clicked.connect(self.toggle_playback)
 
-        self.stop_button = QPushButton("Pause / Stop", self.playback_controls)
+        self.stop_button = QPushButton("Stop", self.playback_controls)
         self.stop_button.setObjectName("SecondaryButton")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_playback)
@@ -475,6 +476,14 @@ class MvrPlayerMainWindow(QMainWindow):
             """
         )
 
+    def _lock_play_pause_button_width(self) -> None:
+        current_text = self.play_button.text()
+        self.play_button.setText("Pause")
+        self.play_button.ensurePolished()
+        pause_width = self.play_button.sizeHint().width()
+        self.play_button.setFixedWidth(pause_width)
+        self.play_button.setText(current_text)
+
     def open_dialog(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -631,6 +640,13 @@ class MvrPlayerMainWindow(QMainWindow):
             icon=QMessageBox.Icon.Warning,
         )
 
+    def toggle_playback(self, checked: bool = False) -> None:
+        if self._playback_started or self.player.is_playing():
+            self.pause_playback()
+            return
+
+        self.play()
+
     def play(self, start_seconds: float | None = None) -> None:
         if self.selected_file is None:
             self.statusBar().showMessage("Сначала выберите MVR-файл")
@@ -672,7 +688,25 @@ class MvrPlayerMainWindow(QMainWindow):
         self.statusBar().showMessage(f"Воспроизведение: {self.selected_file}")
         self.frame_timer.start()
 
-    def stop_playback(self) -> None:
+    def pause_playback(self) -> None:
+        if self.selected_file is None:
+            self.statusBar().showMessage("Файл не выбран")
+            return
+        if not (self._playback_started or self.player.is_playing()):
+            self._set_playback_controls(False)
+            return
+
+        current_seconds = self._clamp_playback_seconds(self._current_playback_seconds())
+        self.frame_timer.stop()
+        self.player.stop()
+        self._playback_started = False
+        self._playback_started_at = 0.0
+        self._playback_base_seconds = current_seconds
+        self._update_playback_progress(current_seconds)
+        self._set_playback_controls(False)
+        self.statusBar().showMessage(f"Пауза: {_format_duration(current_seconds)}")
+
+    def stop_playback(self, checked: bool = False, *, reset_preview: bool = True) -> None:
         self.frame_timer.stop()
         self.player.stop()
         self._playback_started = False
@@ -686,6 +720,8 @@ class MvrPlayerMainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage(f"Воспроизведение остановлено: {self.selected_file}")
+        if reset_preview:
+            self._seek_to_seconds(0.0)
 
     def _poll_player(self) -> None:
         frame = self.player.read_frame()
@@ -964,6 +1000,8 @@ class MvrPlayerMainWindow(QMainWindow):
 
     def _set_file_controls_enabled(self, enabled: bool) -> None:
         if self._conversion_in_progress:
+            self.play_button.setText("Play")
+            self.stop_button.setText("Stop")
             self.convert_button.setEnabled(False)
             self.convert_action.setEnabled(False)
             self.play_button.setEnabled(False)
@@ -973,12 +1011,16 @@ class MvrPlayerMainWindow(QMainWindow):
 
         self.convert_button.setEnabled(enabled)
         self.convert_action.setEnabled(enabled)
+        self.play_button.setText("Play")
+        self.stop_button.setText("Stop")
         self.play_button.setEnabled(enabled)
-        self.stop_button.setEnabled(False)
+        self.stop_button.setEnabled(enabled)
         self.playback_slider.setEnabled(enabled and self._duration_seconds is not None)
 
     def _set_playback_controls(self, is_playing: bool) -> None:
         if self._conversion_in_progress:
+            self.play_button.setText("Play")
+            self.stop_button.setText("Stop")
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.convert_button.setEnabled(False)
@@ -986,8 +1028,11 @@ class MvrPlayerMainWindow(QMainWindow):
             self.playback_slider.setEnabled(False)
             return
 
-        self.play_button.setEnabled(not is_playing and self.selected_file is not None)
-        self.stop_button.setEnabled(is_playing)
+        has_file = self.selected_file is not None
+        self.play_button.setText("Pause" if is_playing else "Play")
+        self.stop_button.setText("Stop")
+        self.play_button.setEnabled(has_file)
+        self.stop_button.setEnabled(has_file)
         self.convert_button.setEnabled(self.selected_file is not None)
         self.convert_action.setEnabled(self.selected_file is not None)
         self.playback_slider.setEnabled(self.selected_file is not None and self._duration_seconds is not None)
@@ -1029,7 +1074,7 @@ class MvrPlayerMainWindow(QMainWindow):
             output_path = output_path.with_suffix(".mp4")
 
         source_path = self.selected_file
-        self.stop_playback()
+        self.stop_playback(reset_preview=False)
         self._conversion_generation += 1
         generation = self._conversion_generation
         self._set_conversion_busy(True)
@@ -1114,6 +1159,8 @@ class MvrPlayerMainWindow(QMainWindow):
             self.conversion_progress_bar.setRange(0, 0)
             self.conversion_progress_bar.show()
             self.conversion_status_timer.start()
+            self.play_button.setText("Play")
+            self.stop_button.setText("Stop")
             self.convert_button.setEnabled(False)
             self.convert_action.setEnabled(False)
             self.play_button.setEnabled(False)
@@ -1123,11 +1170,7 @@ class MvrPlayerMainWindow(QMainWindow):
 
         self.conversion_status_timer.stop()
         self.conversion_progress_bar.hide()
-        self.convert_button.setEnabled(self.selected_file is not None)
-        self.convert_action.setEnabled(self.selected_file is not None)
-        self.play_button.setEnabled(self.selected_file is not None and not self.player.is_playing())
-        self.stop_button.setEnabled(self.player.is_playing())
-        self.playback_slider.setEnabled(self.selected_file is not None and self._duration_seconds is not None)
+        self._set_playback_controls(self._playback_started or self.player.is_playing())
 
     def _refresh_conversion_status(self) -> None:
         if not self._conversion_in_progress:
