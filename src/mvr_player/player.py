@@ -79,14 +79,20 @@ class MvrPlayer:
 
     def set_file(self, file_path: str | Path) -> Path:
         """Select a file for playback."""
-        path = Path(file_path).expanduser()
-        if not path.exists():
-            raise PlayerFileError(f"Файл не найден: {path}")
-        if not path.is_file():
-            raise PlayerFileError(f"Выбранный путь не является файлом: {path}")
+        try:
+            path = Path(file_path).expanduser()
+            if not path.exists():
+                raise PlayerFileError(f"Файл не найден: {path}")
+            if not path.is_file():
+                raise PlayerFileError(f"Выбранный путь не является файлом: {path}")
+            if path.stat().st_size <= 0:
+                raise PlayerFileError(f"Файл пустой: {path}")
+            resolved_path = path.resolve()
+        except OSError as exc:
+            raise PlayerFileError(f"Не удалось проверить файл: {exc}") from exc
 
         self.stop()
-        self.file_path = path.resolve()
+        self.file_path = resolved_path
         self._last_returncode = None
         self._stderr_lines.clear()
         self._clear_frames()
@@ -324,8 +330,11 @@ class MvrPlayer:
             return self._input_args(), subprocess.DEVNULL, start_seconds
 
         seek_point = self._seek_point_for_seconds(start_seconds)
-        input_file = self.file_path.open("rb")
-        input_file.seek(seek_point.offset)
+        try:
+            input_file = self.file_path.open("rb")
+            input_file.seek(seek_point.offset)
+        except OSError as exc:
+            raise PlayerFileError(f"Не удалось прочитать файл: {exc}") from exc
         args = ["-r", str(PLAYBACK_FPS), "-f", "h264", "-i", "-"]
         return args, input_file, max(0.0, start_seconds - seek_point.seconds)
 
@@ -339,7 +348,10 @@ class MvrPlayer:
         if file_path.suffix.lower() != ".mvr":
             return [SeekPoint(seconds=0.0, offset=0)]
 
-        if file_path.stat().st_size == 0:
+        try:
+            if file_path.stat().st_size == 0:
+                return [SeekPoint(seconds=0.0, offset=0)]
+        except OSError:
             return [SeekPoint(seconds=0.0, offset=0)]
 
         code3 = bytes([0, 0, 1])
@@ -422,7 +434,11 @@ class MvrPlayer:
         frame_size = width * height * 3
         with stdout:
             while not self._stop_requested:
-                pixels = stdout.read(frame_size)
+                try:
+                    pixels = stdout.read(frame_size)
+                except OSError as exc:
+                    self._stderr_lines.append(f"Ошибка чтения видеокадра: {exc}")
+                    break
                 if len(pixels) != frame_size:
                     break
                 self._put_frame(VideoFrame(width=width, height=height, data=pixels))
@@ -436,11 +452,14 @@ class MvrPlayer:
                 pass
 
     def _collect_stderr(self, stderr: BinaryIO) -> None:
-        with stderr:
-            for line in stderr:
-                decoded_line = line.decode("utf-8", errors="replace").strip()
-                if decoded_line:
-                    self._stderr_lines.append(decoded_line)
+        try:
+            with stderr:
+                for line in stderr:
+                    decoded_line = line.decode("utf-8", errors="replace").strip()
+                    if decoded_line:
+                        self._stderr_lines.append(decoded_line)
+        except OSError as exc:
+            self._stderr_lines.append(f"Ошибка чтения stderr FFmpeg: {exc}")
 
     def _clear_frames(self) -> None:
         while True:
@@ -454,6 +473,7 @@ class MvrPlayer:
         self._stdin_file = None
         if stdin_file is not None and not stdin_file.closed:
             stdin_file.close()
+
 
 def _parse_progress_frame_count(progress_output: str) -> int:
     frame_count = 0

@@ -68,7 +68,12 @@ class MvrConverter:
             self._remove_file_if_exists(temp_output)
             raise MvrConversionError("FFmpeg завершился, но MP4-файл не был создан.")
 
-        temp_output.replace(output)
+        try:
+            temp_output.replace(output)
+        except OSError as exc:
+            self._remove_file_if_exists(temp_output)
+            raise MvrConversionError(f"Не удалось сохранить MP4-файл: {exc}") from exc
+
         if progress_callback is not None:
             progress_callback(ConversionProgress(finished=True))
         return output.resolve()
@@ -157,6 +162,12 @@ class MvrConverter:
             if process.stdout is not None:
                 self._read_progress(process.stdout, progress_callback)
             returncode = process.wait()
+        except OSError as exc:
+            self.cancel()
+            raise MvrConversionError(f"Ошибка чтения прогресса FFmpeg: {exc}") from exc
+        except Exception as exc:
+            self.cancel()
+            raise MvrConversionError(f"Неожиданная ошибка во время конвертации: {exc}") from exc
         finally:
             with self._lock:
                 if self._process is process:
@@ -194,22 +205,32 @@ class MvrConverter:
                     lines.append(decoded)
 
     def _validate_source(self, source_path: str | Path) -> Path:
-        source = Path(source_path).expanduser().resolve()
-        if not source.exists():
-            raise ConversionFileError(f"Файл не найден: {source}")
-        if not source.is_file():
-            raise ConversionFileError(f"Выбранный путь не является файлом: {source}")
+        try:
+            source = Path(source_path).expanduser().resolve()
+            if not source.exists():
+                raise ConversionFileError(f"Файл не найден: {source}")
+            if not source.is_file():
+                raise ConversionFileError(f"Выбранный путь не является файлом: {source}")
+            if source.stat().st_size <= 0:
+                raise ConversionFileError(f"Файл пустой: {source}")
+        except OSError as exc:
+            raise ConversionFileError(f"Не удалось проверить исходный файл: {exc}") from exc
         return source
 
     def _normalise_output_path(self, output_path: str | Path) -> Path:
-        output = Path(output_path).expanduser()
-        if output.suffix.lower() != ".mp4":
-            output = output.with_suffix(".mp4")
-        if not output.parent.exists():
-            raise ConversionFileError(f"Папка для сохранения не найдена: {output.parent}")
-        if not output.parent.is_dir():
-            raise ConversionFileError(f"Путь сохранения не является папкой: {output.parent}")
-        return output.resolve()
+        try:
+            output = Path(output_path).expanduser()
+            if output.suffix.lower() != ".mp4":
+                output = output.with_suffix(".mp4")
+            if output.exists() and output.is_dir():
+                raise ConversionFileError(f"Путь сохранения указывает на папку: {output}")
+            if not output.parent.exists():
+                raise ConversionFileError(f"Папка для сохранения не найдена: {output.parent}")
+            if not output.parent.is_dir():
+                raise ConversionFileError(f"Путь сохранения не является папкой: {output.parent}")
+            return output.resolve()
+        except OSError as exc:
+            raise ConversionFileError(f"Не удалось проверить путь сохранения: {exc}") from exc
 
     def _temporary_output_path(self, output: Path) -> Path:
         return output.with_name(f".{output.stem}.mvr-player-tmp{output.suffix}")

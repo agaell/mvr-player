@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .converter import ConversionProgress, MvrConversionError, MvrConverter
+from .errors import LOG_FILE, UserFacingError, configure_error_logging, log_exception, traceback_text, user_message
 from .player import PLAYBACK_FPS, FfmpegNotFoundError, MvrPlayer, MvrPlayerError, PlayerFileError, VideoFrame
 from .settings import APP_ICON_FILES, APP_NAME, APP_VERSION, DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE
 
@@ -40,6 +41,7 @@ class QtMvrPlayerApp:
     """Small wrapper that owns the QApplication instance."""
 
     def __init__(self, initial_file: str | Path | None = None) -> None:
+        configure_error_logging()
         self.app = QApplication.instance() or QApplication(sys.argv)
         self.app.setApplicationName(APP_NAME)
         self.app.setApplicationVersion(APP_VERSION)
@@ -48,6 +50,7 @@ class QtMvrPlayerApp:
             self.app.setWindowIcon(self.app_icon)
 
         self.window = MvrPlayerMainWindow(app_icon=self.app_icon)
+        self._install_exception_hooks()
         if initial_file is not None:
             QTimer.singleShot(250, lambda: self.window.open_file(initial_file))
 
@@ -55,6 +58,24 @@ class QtMvrPlayerApp:
         """Show the main window and start the Qt event loop."""
         self.window.show()
         self.app.exec()
+
+    def _install_exception_hooks(self) -> None:
+        sys.excepthook = self._handle_unhandled_exception
+        threading.excepthook = self._handle_thread_exception
+
+    def _handle_unhandled_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        log_exception("Unhandled UI error", exc_value)
+        details = "".join(traceback_text(exc_value).splitlines(keepends=True))
+        if self.window.isVisible() and not self.window._closing:
+            self.window.show_error(
+                "Непредвиденная ошибка",
+                user_message(exc_value, "Приложение столкнулось с непредвиденной ошибкой."),
+                details=details,
+                log_hint=True,
+            )
+
+    def _handle_thread_exception(self, args: threading.ExceptHookArgs) -> None:
+        log_exception(f"Unhandled worker error in {args.thread.name}", args.exc_value)
 
 
 class MvrPlayerMainWindow(QMainWindow):
@@ -465,7 +486,24 @@ class MvrPlayerMainWindow(QMainWindow):
             self.open_file(filename)
 
     def open_file(self, file_path: str | Path) -> None:
-        path = Path(file_path).expanduser()
+        try:
+            path = Path(file_path).expanduser()
+            if not path.exists():
+                raise PlayerFileError(f"Файл не найден: {path}")
+            if not path.is_file():
+                raise PlayerFileError(f"Выбранный путь не является файлом: {path}")
+            if path.stat().st_size <= 0:
+                raise PlayerFileError(f"Файл пустой: {path}")
+        except (OSError, RuntimeError, PlayerFileError) as exc:
+            self.statusBar().showMessage("Не удалось открыть файл")
+            self.show_error(
+                "Не удалось открыть файл",
+                user_message(exc, "Проверьте файл и попробуйте снова."),
+                details=self._error_details(exc),
+                icon=QMessageBox.Icon.Warning,
+            )
+            return
+
         self._load_generation += 1
         generation = self._load_generation
 
@@ -503,11 +541,24 @@ class MvrPlayerMainWindow(QMainWindow):
         except (PlayerFileError, MvrPlayerError) as exc:
             self._load_events.put(("error", generation, exc))
             return
+        except Exception as exc:
+            log_exception("Unexpected error while loading preview", exc)
+            self._load_events.put(
+                (
+                    "error",
+                    generation,
+                    UserFacingError("Неожиданная ошибка при подготовке видео.", traceback_text(exc)),
+                )
+            )
+            return
 
         self._load_events.put(("ready", generation, (resolved_path, preview)))
         try:
             duration_seconds = preview_player.estimate_duration_seconds()
         except MvrPlayerError:
+            duration_seconds = None
+        except Exception as exc:
+            log_exception("Unexpected error while estimating duration", exc)
             duration_seconds = None
         self._load_events.put(("duration_ready", generation, duration_seconds))
 
@@ -520,13 +571,16 @@ class MvrPlayerMainWindow(QMainWindow):
 
             if generation != self._load_generation or self._closing:
                 continue
-            if event_name == "ready":
-                path, preview = payload
-                self._on_preview_ready(generation, path, preview)
-            elif event_name == "error":
-                self._on_preview_error(payload)
-            elif event_name == "duration_ready":
-                self._on_duration_ready(payload)
+            try:
+                if event_name == "ready":
+                    path, preview = payload
+                    self._on_preview_ready(generation, path, preview)
+                elif event_name == "error":
+                    self._on_preview_error(payload)
+                elif event_name == "duration_ready":
+                    self._on_duration_ready(payload)
+            except Exception as exc:
+                self._handle_unexpected_ui_error("Ошибка обработки видео", exc)
 
         self._pump_conversion_events()
         self._pump_seek_events()
@@ -558,6 +612,7 @@ class MvrPlayerMainWindow(QMainWindow):
         self._update_playback_progress(self._playback_position_seconds)
 
     def _on_preview_error(self, exc: object) -> None:
+        message = user_message(exc, "Не удалось получить первый кадр.")
         self.selected_file = None
         self.player.stop()
         self._reset_playback_progress()
@@ -565,11 +620,16 @@ class MvrPlayerMainWindow(QMainWindow):
         self.file_label.setText("Файл не выбран")
         self._show_empty_state(
             "Видео не прочитано",
-            str(exc) or "Не удалось получить первый кадр",
+            message,
             "Открыть другой файл",
         )
         self.statusBar().showMessage("Не удалось получить первый кадр")
-        QMessageBox.critical(self, "Не удалось открыть видео", str(exc))
+        self.show_error(
+            "Не удалось открыть видео",
+            message,
+            details=self._error_details(exc),
+            icon=QMessageBox.Icon.Warning,
+        )
 
     def play(self, start_seconds: float | None = None) -> None:
         if self.selected_file is None:
@@ -588,10 +648,19 @@ class MvrPlayerMainWindow(QMainWindow):
         try:
             self.player.play(max_size=self._video_surface_size(), start_seconds=start_seconds)
         except FfmpegNotFoundError as exc:
-            self._handle_play_error("FFmpeg не найден", str(exc))
+            self._handle_play_error("FFmpeg не найден", str(exc), details=self._error_details(exc))
             return
         except MvrPlayerError as exc:
-            self._handle_play_error("Ошибка воспроизведения", str(exc))
+            self._handle_play_error("Ошибка воспроизведения", str(exc), details=self._error_details(exc))
+            return
+        except Exception as exc:
+            log_exception("Unexpected error while starting playback", exc)
+            self._handle_play_error(
+                "Ошибка воспроизведения",
+                "Неожиданная ошибка при запуске видео.",
+                details=traceback_text(exc),
+                log_hint=True,
+            )
             return
 
         self._playback_started = True
@@ -647,10 +716,10 @@ class MvrPlayerMainWindow(QMainWindow):
         details = self.player.last_error
         message = "FFmpeg завершился с ошибкой."
         if details:
-            message = f"{message}\n\n{details}"
+            message = user_message(details, message)
         self._show_empty_state("Не удалось воспроизвести файл", "Проверьте формат файла и FFmpeg", "Открыть другой файл")
         self.statusBar().showMessage("Воспроизведение завершилось с ошибкой")
-        QMessageBox.critical(self, "Ошибка воспроизведения", message)
+        self.show_error("Ошибка воспроизведения", message, details=details)
 
     def _display_frame(self, frame: VideoFrame) -> None:
         image = QImage(
@@ -695,6 +764,44 @@ class MvrPlayerMainWindow(QMainWindow):
         self.empty_button.setText(button_text)
         self.video_label.clear()
         self.video_stack.setCurrentWidget(self.empty_view)
+
+    def show_error(
+        self,
+        title: str,
+        message: str,
+        *,
+        details: str | None = None,
+        log_hint: bool = False,
+        icon: QMessageBox.Icon = QMessageBox.Icon.Critical,
+    ) -> None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(icon)
+        dialog.setWindowTitle(title)
+        dialog.setText(message)
+        if log_hint:
+            dialog.setInformativeText(f"Подробности записаны в лог:\n{LOG_FILE}")
+        if details and details.strip() != message.strip():
+            dialog.setDetailedText(details)
+        dialog.exec()
+
+    def _error_details(self, exc: object) -> str | None:
+        if isinstance(exc, UserFacingError):
+            return exc.details
+        if isinstance(exc, (MvrConversionError, MvrPlayerError)):
+            return str(exc).strip() or None
+        if isinstance(exc, BaseException):
+            return traceback_text(exc)
+        return None
+
+    def _handle_unexpected_ui_error(self, title: str, exc: BaseException) -> None:
+        log_exception(title, exc)
+        self.statusBar().showMessage(title)
+        self.show_error(
+            title,
+            user_message(exc, "Приложение столкнулось с непредвиденной ошибкой."),
+            details=traceback_text(exc),
+            log_hint=True,
+        )
 
     def _reset_playback_progress(self) -> None:
         self._duration_seconds = None
@@ -809,6 +916,16 @@ class MvrPlayerMainWindow(QMainWindow):
         except (PlayerFileError, MvrPlayerError) as exc:
             self._seek_events.put(("seek_error", generation, exc))
             return
+        except Exception as exc:
+            log_exception("Unexpected error while seeking preview", exc)
+            self._seek_events.put(
+                (
+                    "seek_error",
+                    generation,
+                    UserFacingError("Неожиданная ошибка при перемотке видео.", traceback_text(exc)),
+                )
+            )
+            return
 
         self._seek_events.put(("seek_ready", generation, (target_seconds, frame)))
 
@@ -821,11 +938,14 @@ class MvrPlayerMainWindow(QMainWindow):
 
             if generation != self._seek_generation or self._closing:
                 continue
-            if event_name == "seek_ready":
-                target_seconds, frame = payload
-                self._on_seek_preview_ready(target_seconds, frame)
-            elif event_name == "seek_error":
-                self._on_seek_preview_error(payload)
+            try:
+                if event_name == "seek_ready":
+                    target_seconds, frame = payload
+                    self._on_seek_preview_ready(target_seconds, frame)
+                elif event_name == "seek_error":
+                    self._on_seek_preview_error(payload)
+            except Exception as exc:
+                self._handle_unexpected_ui_error("Ошибка перемотки", exc)
 
     def _on_seek_preview_ready(self, target_seconds: float, frame: VideoFrame) -> None:
         self._display_frame(frame)
@@ -833,8 +953,14 @@ class MvrPlayerMainWindow(QMainWindow):
         self.statusBar().showMessage(f"Позиция: {_format_duration(target_seconds)}")
 
     def _on_seek_preview_error(self, exc: object) -> None:
+        message = user_message(exc, "Не удалось перемотать видео.")
         self.statusBar().showMessage("Не удалось перемотать видео")
-        QMessageBox.warning(self, "Перемотка", str(exc))
+        self.show_error(
+            "Перемотка",
+            message,
+            details=self._error_details(exc),
+            icon=QMessageBox.Icon.Warning,
+        )
 
     def _set_file_controls_enabled(self, enabled: bool) -> None:
         if self._conversion_in_progress:
@@ -866,11 +992,19 @@ class MvrPlayerMainWindow(QMainWindow):
         self.convert_action.setEnabled(self.selected_file is not None)
         self.playback_slider.setEnabled(self.selected_file is not None and self._duration_seconds is not None)
 
-    def _handle_play_error(self, title: str, message: str) -> None:
+    def _handle_play_error(
+        self,
+        title: str,
+        message: str,
+        *,
+        details: str | None = None,
+        log_hint: bool = False,
+    ) -> None:
+        message = user_message(message, message)
         self._set_playback_controls(False)
         self.statusBar().showMessage(title)
         self._show_empty_state("Видео не запущено", message, "Открыть другой файл")
-        QMessageBox.critical(self, "Не удалось воспроизвести файл", message)
+        self.show_error("Не удалось воспроизвести файл", message, details=details, log_hint=log_hint)
 
     def _convert_to_mp4(self) -> None:
         if self.selected_file is None:
@@ -920,6 +1054,16 @@ class MvrPlayerMainWindow(QMainWindow):
         except MvrConversionError as exc:
             self._conversion_events.put(("error", generation, exc))
             return
+        except Exception as exc:
+            log_exception("Unexpected error while converting video", exc)
+            self._conversion_events.put(
+                (
+                    "error",
+                    generation,
+                    UserFacingError("Неожиданная ошибка при конвертации видео.", traceback_text(exc)),
+                )
+            )
+            return
 
         self._conversion_events.put(("ready", generation, converted_path))
 
@@ -932,12 +1076,15 @@ class MvrPlayerMainWindow(QMainWindow):
 
             if generation != self._conversion_generation or self._closing:
                 continue
-            if event_name == "ready":
-                self._on_conversion_ready(payload)
-            elif event_name == "error":
-                self._on_conversion_error(payload)
-            elif event_name == "progress":
-                self._on_conversion_progress(payload)
+            try:
+                if event_name == "ready":
+                    self._on_conversion_ready(payload)
+                elif event_name == "error":
+                    self._on_conversion_error(payload)
+                elif event_name == "progress":
+                    self._on_conversion_progress(payload)
+            except Exception as exc:
+                self._handle_unexpected_ui_error("Ошибка конвертации", exc)
 
     def _on_conversion_ready(self, output_path: Path) -> None:
         self._set_conversion_busy(False)
@@ -945,9 +1092,10 @@ class MvrPlayerMainWindow(QMainWindow):
         QMessageBox.information(self, "Конвертация завершена", f"MP4 сохранен:\n{output_path}")
 
     def _on_conversion_error(self, exc: object) -> None:
+        message = user_message(exc, "Не удалось сконвертировать файл.")
         self._set_conversion_busy(False)
         self.statusBar().showMessage("Ошибка конвертации")
-        QMessageBox.critical(self, "Не удалось сконвертировать файл", str(exc))
+        self.show_error("Не удалось сконвертировать файл", message, details=self._error_details(exc))
 
     def _on_conversion_progress(self, progress: ConversionProgress) -> None:
         self._latest_conversion_progress = progress

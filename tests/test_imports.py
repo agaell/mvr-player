@@ -8,6 +8,7 @@ class ImportTests(unittest.TestCase):
         import mvr_player
         from mvr_player import app
         from mvr_player import converter
+        from mvr_player import errors
         from mvr_player import ffmpeg_utils
         from mvr_player import main
         from mvr_player import player
@@ -21,11 +22,20 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(settings.APP_VERSION, "0.1.0")
         self.assertTrue(app)
         self.assertTrue(converter)
+        self.assertTrue(errors)
         self.assertTrue(ffmpeg_utils)
         self.assertTrue(main)
         self.assertTrue(player)
         self.assertTrue(ui)
         self.assertTrue(utils)
+
+    def test_ffmpeg_error_message_is_user_friendly(self) -> None:
+        from mvr_player.errors import user_message
+
+        message = user_message("Invalid data found when processing input")
+
+        self.assertIn("FFmpeg", message)
+        self.assertIn("файл", message)
 
 
 if __name__ == "__main__":

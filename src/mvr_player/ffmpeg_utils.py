@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -16,8 +17,13 @@ def find_ffmpeg(configured_path: str | None = None) -> str:
     """Return a usable FFmpeg executable path."""
     if configured_path is not None:
         configured = Path(configured_path).expanduser()
-        if configured.exists():
-            return str(configured)
+        if not configured.exists():
+            raise FfmpegLookupError(f"Указанный FFmpeg не найден: {configured}")
+        if not configured.is_file():
+            raise FfmpegLookupError(f"Указанный путь FFmpeg не является файлом: {configured}")
+        if not _is_executable(configured):
+            raise FfmpegLookupError(f"Указанный FFmpeg нельзя запустить: {configured}")
+        return str(configured)
 
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is not None:
@@ -49,3 +55,7 @@ def input_args_for_file(file_path: str | Path) -> list[str]:
     if path.suffix.lower() == ".mvr":
         return ["-f", "h264", "-i", str(path)]
     return ["-i", str(path)]
+
+
+def _is_executable(path: Path) -> bool:
+    return path.exists() and path.is_file() and os.access(path, os.X_OK)
