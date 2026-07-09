@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .ffmpeg_utils import FfmpegLookupError, find_ffmpeg, input_args_for_file
+from .ffmpeg_utils import MVR_SOURCE_FPS, FfmpegLookupError, find_ffmpeg, input_args_for_file
 
 CONVERSION_FPS = 24
 
@@ -91,7 +91,7 @@ class MvrConverter:
     def _conversion_command(self, ffmpeg: str, source: Path, output: Path) -> list[str]:
         input_args = input_args_for_file(source)
         if source.suffix.lower() == ".mvr":
-            input_args = ["-r", str(CONVERSION_FPS), *input_args]
+            input_args = ["-r", str(MVR_SOURCE_FPS), *input_args]
 
         return [
             ffmpeg,

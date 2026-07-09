@@ -5,6 +5,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+MVR_SOURCE_FPS = 14
+
 
 class FfmpegLookupError(Exception):
     """Raised when FFmpeg cannot be located."""

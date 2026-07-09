@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QStackedLayout,
     QStatusBar,
     QVBoxLayout,
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .converter import ConversionProgress, MvrConversionError, MvrConverter
-from .player import FfmpegNotFoundError, MvrPlayer, MvrPlayerError, PlayerFileError, VideoFrame
+from .player import PLAYBACK_FPS, FfmpegNotFoundError, MvrPlayer, MvrPlayerError, PlayerFileError, VideoFrame
 from .settings import APP_NAME, APP_VERSION, DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE
 
 UI_BUILD = f"qt-playback-{APP_VERSION}"
@@ -63,6 +64,8 @@ class MvrPlayerMainWindow(QMainWindow):
         self.selected_file: Path | None = None
         self._load_generation = 0
         self._load_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
+        self._seek_generation = 0
+        self._seek_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
         self._conversion_generation = 0
         self._conversion_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
         self._conversion_in_progress = False
@@ -72,6 +75,14 @@ class MvrPlayerMainWindow(QMainWindow):
         self._last_pixmap: QPixmap | None = None
         self._first_frame_seen = False
         self._playback_started = False
+        self._playback_started_at = 0.0
+        self._playback_base_seconds = 0.0
+        self._playback_position_seconds = 0.0
+        self._duration_seconds: float | None = None
+        self._slider_dragging = False
+        self._updating_slider = False
+        self._video_fullscreen = False
+        self._surface_refresh_generation = 0
         self._closing = False
 
         self.load_timer = QTimer(self)
@@ -80,7 +91,7 @@ class MvrPlayerMainWindow(QMainWindow):
         self.load_timer.start()
 
         self.frame_timer = QTimer(self)
-        self.frame_timer.setInterval(24)
+        self.frame_timer.setInterval(round(1000 / PLAYBACK_FPS))
         self.frame_timer.timeout.connect(self._poll_player)
 
         self.conversion_status_timer = QTimer(self)
@@ -141,15 +152,16 @@ class MvrPlayerMainWindow(QMainWindow):
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(18, 16, 18, 0)
         root_layout.setSpacing(14)
+        self.root_layout = root_layout
         self.setCentralWidget(root)
 
-        header = QFrame(root)
-        header.setObjectName("Header")
-        header_layout = QHBoxLayout(header)
+        self.header = QFrame(root)
+        self.header.setObjectName("Header")
+        header_layout = QHBoxLayout(self.header)
         header_layout.setContentsMargins(18, 14, 18, 14)
         header_layout.setSpacing(10)
 
-        title_box = QWidget(header)
+        title_box = QWidget(self.header)
         title_layout = QVBoxLayout(title_box)
         title_layout.setContentsMargins(0, 0, 14, 0)
         title_layout.setSpacing(2)
@@ -161,26 +173,16 @@ class MvrPlayerMainWindow(QMainWindow):
         title_layout.addWidget(self.title_label)
         title_layout.addWidget(self.version_label)
 
-        self.open_button = QPushButton("Открыть MVR", header)
+        self.open_button = QPushButton("Открыть MVR", self.header)
         self.open_button.setObjectName("PrimaryButton")
         self.open_button.clicked.connect(self.open_dialog)
 
-        self.convert_button = QPushButton("Конвертировать в MP4", header)
+        self.convert_button = QPushButton("Конвертировать в MP4", self.header)
         self.convert_button.setObjectName("SecondaryButton")
         self.convert_button.setEnabled(False)
         self.convert_button.clicked.connect(self._convert_to_mp4)
 
-        self.play_button = QPushButton("Play", header)
-        self.play_button.setObjectName("SecondaryButton")
-        self.play_button.setEnabled(False)
-        self.play_button.clicked.connect(self.play)
-
-        self.stop_button = QPushButton("Pause / Stop", header)
-        self.stop_button.setObjectName("SecondaryButton")
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self.stop_playback)
-
-        self.file_label = QLabel("Файл не выбран", header)
+        self.file_label = QLabel("Файл не выбран", self.header)
         self.file_label.setObjectName("FileLabel")
         self.file_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.file_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -188,10 +190,8 @@ class MvrPlayerMainWindow(QMainWindow):
         header_layout.addWidget(title_box)
         header_layout.addWidget(self.open_button)
         header_layout.addWidget(self.convert_button)
-        header_layout.addWidget(self.play_button)
-        header_layout.addWidget(self.stop_button)
         header_layout.addWidget(self.file_label, 1)
-        root_layout.addWidget(header)
+        root_layout.addWidget(self.header)
 
         self.video_shell = QFrame(root)
         self.video_shell.setObjectName("VideoShell")
@@ -238,6 +238,48 @@ class MvrPlayerMainWindow(QMainWindow):
         self.video_stack.addWidget(self.empty_view)
         self.video_stack.addWidget(self.video_label)
         root_layout.addWidget(self.video_shell, 1)
+
+        self.playback_controls = QFrame(root)
+        self.playback_controls.setObjectName("PlaybackControls")
+        playback_layout = QHBoxLayout(self.playback_controls)
+        playback_layout.setContentsMargins(16, 12, 16, 12)
+        playback_layout.setSpacing(12)
+
+        self.current_time_label = QLabel("00:00", self.playback_controls)
+        self.current_time_label.setObjectName("TimeLabel")
+        self.current_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.current_time_label.setMinimumWidth(52)
+
+        self.playback_slider = QSlider(Qt.Orientation.Horizontal, self.playback_controls)
+        self.playback_slider.setObjectName("PlaybackSlider")
+        self.playback_slider.setRange(0, 0)
+        self.playback_slider.setEnabled(False)
+        self.playback_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.playback_slider.sliderPressed.connect(self._on_playback_slider_pressed)
+        self.playback_slider.sliderReleased.connect(self._on_playback_slider_released)
+        self.playback_slider.valueChanged.connect(self._on_playback_slider_value_changed)
+
+        self.duration_time_label = QLabel("--:--", self.playback_controls)
+        self.duration_time_label.setObjectName("TimeLabel")
+        self.duration_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.duration_time_label.setMinimumWidth(52)
+
+        self.play_button = QPushButton("Play", self.playback_controls)
+        self.play_button.setObjectName("PrimaryButton")
+        self.play_button.setEnabled(False)
+        self.play_button.clicked.connect(self.play)
+
+        self.stop_button = QPushButton("Pause / Stop", self.playback_controls)
+        self.stop_button.setObjectName("SecondaryButton")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_playback)
+
+        playback_layout.addWidget(self.current_time_label)
+        playback_layout.addWidget(self.playback_slider, 1)
+        playback_layout.addWidget(self.duration_time_label)
+        playback_layout.addWidget(self.play_button)
+        playback_layout.addWidget(self.stop_button)
+        root_layout.addWidget(self.playback_controls)
         self._install_drop_handlers(root)
 
         status_bar = QStatusBar(self)
@@ -346,6 +388,48 @@ class MvrPlayerMainWindow(QMainWindow):
                 background: #000000;
                 border-radius: 8px;
             }
+            QFrame#PlaybackControls {
+                background: #ffffff;
+                border: 1px solid #dce3ee;
+                border-radius: 8px;
+            }
+            QLabel#TimeLabel {
+                color: #334155;
+                font-family: Menlo, Monaco, Consolas, monospace;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QSlider#PlaybackSlider {
+                min-height: 22px;
+            }
+            QSlider#PlaybackSlider::groove:horizontal {
+                height: 6px;
+                border-radius: 3px;
+                background: #dbe4ef;
+            }
+            QSlider#PlaybackSlider::sub-page:horizontal {
+                border-radius: 3px;
+                background: #2563eb;
+            }
+            QSlider#PlaybackSlider::add-page:horizontal {
+                border-radius: 3px;
+                background: #dbe4ef;
+            }
+            QSlider#PlaybackSlider::handle:horizontal {
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: #ffffff;
+                border: 2px solid #2563eb;
+            }
+            QSlider#PlaybackSlider:disabled::sub-page:horizontal {
+                background: #2563eb;
+            }
+            QSlider#PlaybackSlider:disabled::handle:horizontal {
+                background: #ffffff;
+                border-color: #2563eb;
+            }
             QStatusBar#StatusBar {
                 background: #edf2f8;
                 color: #334155;
@@ -381,6 +465,7 @@ class MvrPlayerMainWindow(QMainWindow):
 
         self.frame_timer.stop()
         self._playback_started = False
+        self._reset_playback_progress()
         self._first_frame_seen = False
         self.selected_file = None
         self.player.stop()
@@ -414,6 +499,11 @@ class MvrPlayerMainWindow(QMainWindow):
             return
 
         self._load_events.put(("ready", generation, (resolved_path, preview)))
+        try:
+            duration_seconds = preview_player.estimate_duration_seconds()
+        except MvrPlayerError:
+            duration_seconds = None
+        self._load_events.put(("duration_ready", generation, duration_seconds))
 
     def _pump_load_events(self) -> None:
         while True:
@@ -429,10 +519,18 @@ class MvrPlayerMainWindow(QMainWindow):
                 self._on_preview_ready(generation, path, preview)
             elif event_name == "error":
                 self._on_preview_error(payload)
+            elif event_name == "duration_ready":
+                self._on_duration_ready(payload)
 
         self._pump_conversion_events()
+        self._pump_seek_events()
 
-    def _on_preview_ready(self, generation: int, path: Path, preview: VideoFrame) -> None:
+    def _on_preview_ready(
+        self,
+        generation: int,
+        path: Path,
+        preview: VideoFrame,
+    ) -> None:
         try:
             self.player.set_file(path)
         except (PlayerFileError, MvrPlayerError) as exc:
@@ -440,15 +538,23 @@ class MvrPlayerMainWindow(QMainWindow):
             return
 
         self.selected_file = path
+        self._update_playback_progress(0)
         self._set_file_controls_enabled(True)
         self.file_label.setText(path.name)
         self.statusBar().showMessage("Первый кадр показан. Запускаю воспроизведение...")
         self._display_frame(preview)
         QTimer.singleShot(120, lambda: self.play() if generation == self._load_generation else None)
 
+    def _on_duration_ready(self, duration_seconds: float | None) -> None:
+        if duration_seconds is None:
+            return
+        self._duration_seconds = duration_seconds
+        self._update_playback_progress(self._playback_position_seconds)
+
     def _on_preview_error(self, exc: object) -> None:
         self.selected_file = None
         self.player.stop()
+        self._reset_playback_progress()
         self._set_file_controls_enabled(False)
         self.file_label.setText("Файл не выбран")
         self._show_empty_state(
@@ -459,16 +565,22 @@ class MvrPlayerMainWindow(QMainWindow):
         self.statusBar().showMessage("Не удалось получить первый кадр")
         QMessageBox.critical(self, "Не удалось открыть видео", str(exc))
 
-    def play(self) -> None:
+    def play(self, start_seconds: float | None = None) -> None:
         if self.selected_file is None:
             self.statusBar().showMessage("Сначала выберите MVR-файл")
             return
         if self.player.is_playing():
             return
 
+        if start_seconds is None:
+            start_seconds = self._playback_position_seconds
+        start_seconds = self._clamp_playback_seconds(start_seconds)
+        if self._duration_seconds is not None and start_seconds >= max(0.0, self._duration_seconds - 0.5):
+            start_seconds = 0.0
+
         self._first_frame_seen = self._last_pixmap is not None
         try:
-            self.player.play(max_size=self._video_surface_size())
+            self.player.play(max_size=self._video_surface_size(), start_seconds=start_seconds)
         except FfmpegNotFoundError as exc:
             self._handle_play_error("FFmpeg не найден", str(exc))
             return
@@ -477,6 +589,10 @@ class MvrPlayerMainWindow(QMainWindow):
             return
 
         self._playback_started = True
+        self._playback_base_seconds = start_seconds
+        self._playback_started_at = time.monotonic()
+        self._playback_position_seconds = start_seconds
+        self._update_playback_progress(start_seconds)
         self._set_playback_controls(True)
         self.statusBar().showMessage(f"Воспроизведение: {self.selected_file}")
         self.frame_timer.start()
@@ -485,6 +601,9 @@ class MvrPlayerMainWindow(QMainWindow):
         self.frame_timer.stop()
         self.player.stop()
         self._playback_started = False
+        self._playback_started_at = 0.0
+        self._playback_base_seconds = 0.0
+        self._update_playback_progress(0)
         self._set_playback_controls(False)
         if self.selected_file is None:
             self._show_empty_state()
@@ -498,6 +617,11 @@ class MvrPlayerMainWindow(QMainWindow):
         if frame is not None:
             self._first_frame_seen = True
             self._display_frame(frame)
+            if self._playback_started and self._playback_started_at <= 0:
+                self._playback_started_at = time.monotonic()
+
+        if self._playback_started:
+            self._update_playback_progress(self._current_playback_seconds())
 
         if self.player.is_playing():
             return
@@ -509,6 +633,8 @@ class MvrPlayerMainWindow(QMainWindow):
         self._playback_started = False
         self._set_playback_controls(False)
         if self.player.last_returncode in (None, 0) or self._closing:
+            if self._duration_seconds is not None:
+                self._update_playback_progress(self._duration_seconds)
             self.statusBar().showMessage("Воспроизведение завершено")
             return
 
@@ -533,20 +659,23 @@ class MvrPlayerMainWindow(QMainWindow):
         self._render_current_pixmap()
         self.video_stack.setCurrentWidget(self.video_label)
 
-    def _render_current_pixmap(self) -> None:
+    def _render_current_pixmap(self, target_size: QSize | None = None) -> None:
         if self._last_pixmap is None:
             return
 
-        target_size = self.video_label.size()
+        if target_size is None:
+            target_size = self._display_surface_size()
         if target_size.width() <= 0 or target_size.height() <= 0:
             self.video_label.setPixmap(self._last_pixmap)
             return
 
+        pixel_size = self._to_device_pixels(target_size)
         pixmap = self._last_pixmap.scaled(
-            target_size,
+            pixel_size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        pixmap.setDevicePixelRatio(self._display_pixel_ratio())
         self.video_label.setPixmap(pixmap)
 
     def _show_empty_state(
@@ -561,18 +690,160 @@ class MvrPlayerMainWindow(QMainWindow):
         self.video_label.clear()
         self.video_stack.setCurrentWidget(self.empty_view)
 
+    def _reset_playback_progress(self) -> None:
+        self._duration_seconds = None
+        self._playback_base_seconds = 0.0
+        self._playback_position_seconds = 0.0
+        self.current_time_label.setText("00:00")
+        self.duration_time_label.setText("--:--")
+        self.playback_slider.setEnabled(False)
+        self.playback_slider.setRange(0, 0)
+        self.playback_slider.setValue(0)
+
+    def _current_playback_seconds(self) -> float:
+        if self._playback_started_at <= 0:
+            return self._playback_position_seconds
+        elapsed = time.monotonic() - self._playback_started_at
+        if self._duration_seconds is None:
+            return max(0.0, self._playback_base_seconds + elapsed)
+        return min(self._duration_seconds, max(0.0, self._playback_base_seconds + elapsed))
+
+    def _update_playback_progress(self, current_seconds: float) -> None:
+        self._playback_position_seconds = max(0.0, current_seconds)
+        if self._slider_dragging:
+            return
+
+        self.current_time_label.setText(_format_duration(self._playback_position_seconds))
+
+        if self._duration_seconds is None:
+            self.duration_time_label.setText("--:--")
+            self._set_slider_value(0, max(1, int(self._playback_position_seconds)), int(self._playback_position_seconds))
+            return
+
+        duration = max(1, int(round(self._duration_seconds)))
+        current = min(duration, int(round(self._playback_position_seconds)))
+        self.duration_time_label.setText(_format_duration(self._duration_seconds))
+        self.playback_slider.setEnabled(self.selected_file is not None and not self._conversion_in_progress)
+        self._set_slider_value(0, duration, current)
+
+    def _set_slider_value(self, minimum: int, maximum: int, value: int) -> None:
+        if self._slider_dragging:
+            return
+        self._updating_slider = True
+        try:
+            self.playback_slider.setRange(minimum, maximum)
+            self.playback_slider.setValue(value)
+        finally:
+            self._updating_slider = False
+
+    def _clamp_playback_seconds(self, seconds: float) -> float:
+        value = max(0.0, float(seconds))
+        if self._duration_seconds is None:
+            return value
+        return min(self._duration_seconds, value)
+
+    def _on_playback_slider_pressed(self) -> None:
+        if self.selected_file is None or self._duration_seconds is None:
+            return
+        self._slider_dragging = True
+
+    def _on_playback_slider_value_changed(self, value: int) -> None:
+        if self._updating_slider or not self._slider_dragging:
+            return
+        self.current_time_label.setText(_format_duration(value))
+
+    def _on_playback_slider_released(self) -> None:
+        if self.selected_file is None or self._duration_seconds is None:
+            self._slider_dragging = False
+            return
+
+        target_seconds = self._clamp_playback_seconds(self.playback_slider.value())
+        self._slider_dragging = False
+        self._seek_to_seconds(target_seconds)
+
+    def _seek_to_seconds(self, target_seconds: float) -> None:
+        if self.selected_file is None:
+            return
+
+        target_seconds = self._clamp_playback_seconds(target_seconds)
+        was_playing = self._playback_started or self.player.is_playing()
+        self._seek_generation += 1
+        generation = self._seek_generation
+
+        self.frame_timer.stop()
+        self.player.stop()
+        self._playback_started = False
+        self._playback_started_at = 0.0
+        self._playback_base_seconds = target_seconds
+        self._update_playback_progress(target_seconds)
+        self.statusBar().showMessage(f"Перемотка: {_format_duration(target_seconds)}")
+
+        if was_playing:
+            self.play(start_seconds=target_seconds)
+            return
+
+        self._set_playback_controls(False)
+        threading.Thread(
+            target=self._seek_preview_worker,
+            args=(generation, self.selected_file, target_seconds, self._video_surface_size()),
+            daemon=True,
+        ).start()
+
+    def _seek_preview_worker(
+        self,
+        generation: int,
+        path: Path,
+        target_seconds: float,
+        size: tuple[int, int],
+    ) -> None:
+        preview_player = MvrPlayer()
+        try:
+            preview_player.set_file(path)
+            frame = preview_player.preview_frame(size, start_seconds=target_seconds, timeout=20)
+        except (PlayerFileError, MvrPlayerError) as exc:
+            self._seek_events.put(("seek_error", generation, exc))
+            return
+
+        self._seek_events.put(("seek_ready", generation, (target_seconds, frame)))
+
+    def _pump_seek_events(self) -> None:
+        while True:
+            try:
+                event_name, generation, payload = self._seek_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if generation != self._seek_generation or self._closing:
+                continue
+            if event_name == "seek_ready":
+                target_seconds, frame = payload
+                self._on_seek_preview_ready(target_seconds, frame)
+            elif event_name == "seek_error":
+                self._on_seek_preview_error(payload)
+
+    def _on_seek_preview_ready(self, target_seconds: float, frame: VideoFrame) -> None:
+        self._display_frame(frame)
+        self._update_playback_progress(target_seconds)
+        self.statusBar().showMessage(f"Позиция: {_format_duration(target_seconds)}")
+
+    def _on_seek_preview_error(self, exc: object) -> None:
+        self.statusBar().showMessage("Не удалось перемотать видео")
+        QMessageBox.warning(self, "Перемотка", str(exc))
+
     def _set_file_controls_enabled(self, enabled: bool) -> None:
         if self._conversion_in_progress:
             self.convert_button.setEnabled(False)
             self.convert_action.setEnabled(False)
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
+            self.playback_slider.setEnabled(False)
             return
 
         self.convert_button.setEnabled(enabled)
         self.convert_action.setEnabled(enabled)
         self.play_button.setEnabled(enabled)
         self.stop_button.setEnabled(False)
+        self.playback_slider.setEnabled(enabled and self._duration_seconds is not None)
 
     def _set_playback_controls(self, is_playing: bool) -> None:
         if self._conversion_in_progress:
@@ -580,12 +851,14 @@ class MvrPlayerMainWindow(QMainWindow):
             self.stop_button.setEnabled(False)
             self.convert_button.setEnabled(False)
             self.convert_action.setEnabled(False)
+            self.playback_slider.setEnabled(False)
             return
 
         self.play_button.setEnabled(not is_playing and self.selected_file is not None)
         self.stop_button.setEnabled(is_playing)
         self.convert_button.setEnabled(self.selected_file is not None)
         self.convert_action.setEnabled(self.selected_file is not None)
+        self.playback_slider.setEnabled(self.selected_file is not None and self._duration_seconds is not None)
 
     def _handle_play_error(self, title: str, message: str) -> None:
         self._set_playback_controls(False)
@@ -691,6 +964,7 @@ class MvrPlayerMainWindow(QMainWindow):
             self.convert_action.setEnabled(False)
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
+            self.playback_slider.setEnabled(False)
             return
 
         self.conversion_status_timer.stop()
@@ -699,6 +973,7 @@ class MvrPlayerMainWindow(QMainWindow):
         self.convert_action.setEnabled(self.selected_file is not None)
         self.play_button.setEnabled(self.selected_file is not None and not self.player.is_playing())
         self.stop_button.setEnabled(self.player.is_playing())
+        self.playback_slider.setEnabled(self.selected_file is not None and self._duration_seconds is not None)
 
     def _refresh_conversion_status(self) -> None:
         if not self._conversion_in_progress:
@@ -741,17 +1016,122 @@ class MvrPlayerMainWindow(QMainWindow):
         )
 
     def _video_surface_size(self) -> tuple[int, int]:
-        size = self.video_label.size()
-        width = max(320, size.width())
-        height = max(220, size.height())
+        display_size = self._display_surface_size()
+        fullscreen_size = self._fullscreen_surface_size()
+        target_size = QSize(
+            max(display_size.width(), fullscreen_size.width()),
+            max(display_size.height(), fullscreen_size.height()),
+        )
+        pixel_size = self._to_device_pixels(target_size)
+        width = max(320, pixel_size.width())
+        height = max(220, pixel_size.height())
         return width, height
 
+    def _display_surface_size(self) -> QSize:
+        size = self.video_label.size()
+        return QSize(max(320, size.width()), max(220, size.height()))
+
+    def _fullscreen_surface_size(self) -> QSize:
+        screen = self.screen()
+        window_handle = self.windowHandle()
+        if window_handle is not None and window_handle.screen() is not None:
+            screen = window_handle.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return self._display_surface_size()
+
+        geometry = screen.geometry()
+        controls_height = self.playback_controls.sizeHint().height()
+        return QSize(
+            max(320, geometry.width()),
+            max(220, geometry.height() - controls_height),
+        )
+
+    def _display_pixel_ratio(self) -> float:
+        screen = self.screen()
+        window_handle = self.windowHandle()
+        if window_handle is not None and window_handle.screen() is not None:
+            screen = window_handle.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return 1.0
+        return max(1.0, float(screen.devicePixelRatio()))
+
+    def _to_device_pixels(self, logical_size: QSize) -> QSize:
+        scale = self._display_pixel_ratio()
+        return QSize(
+            max(1, round(logical_size.width() * scale)),
+            max(1, round(logical_size.height() * scale)),
+        )
+
+    def _surface_target_is_ready(self, target_size: tuple[int, int]) -> bool:
+        output_width, output_height = self.player.output_size
+        return output_width >= target_size[0] and output_height >= target_size[1]
+
+    def _pixmap_covers_surface(self, target_size: tuple[int, int]) -> bool:
+        if self._last_pixmap is None:
+            return False
+        return self._last_pixmap.width() >= target_size[0] and self._last_pixmap.height() >= target_size[1]
+
+    def _schedule_surface_refresh(self, position_seconds: float, resume_playback: bool) -> None:
+        if self.selected_file is None:
+            return
+
+        self._surface_refresh_generation += 1
+        generation = self._surface_refresh_generation
+        QTimer.singleShot(
+            80,
+            lambda: self._refresh_surface_for_current_size(generation, position_seconds, resume_playback),
+        )
+
+    def _refresh_surface_for_current_size(
+        self,
+        generation: int,
+        position_seconds: float,
+        resume_playback: bool,
+    ) -> None:
+        if generation != self._surface_refresh_generation or self._closing or self.selected_file is None:
+            return
+
+        target_size = self._video_surface_size()
+        position_seconds = self._clamp_playback_seconds(position_seconds)
+        if resume_playback:
+            if self.player.is_playing() and self._surface_target_is_ready(target_size):
+                return
+
+            self.frame_timer.stop()
+            self.player.stop()
+            self._playback_started = False
+            self._playback_started_at = 0.0
+            self._playback_base_seconds = position_seconds
+            self._update_playback_progress(position_seconds)
+            self.play(start_seconds=position_seconds)
+            return
+
+        if self._pixmap_covers_surface(target_size):
+            return
+
+        self._seek_generation += 1
+        seek_generation = self._seek_generation
+        threading.Thread(
+            target=self._seek_preview_worker,
+            args=(seek_generation, self.selected_file, position_seconds, target_size),
+            daemon=True,
+        ).start()
+
     def _install_drop_handlers(self, root: QWidget) -> None:
+        self._video_click_targets = {self.video_shell, self.empty_view, self.video_label}
         for widget in (root, self.video_shell, self.empty_view, self.video_label):
             widget.setAcceptDrops(True)
             widget.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.MouseButtonDblClick and watched in self._video_click_targets:
+            self._toggle_video_fullscreen()
+            event.accept()
+            return True
         if event.type() == QEvent.Type.DragEnter and event.mimeData().hasUrls():
             event.acceptProposedAction()
             return True
@@ -762,6 +1142,41 @@ class MvrPlayerMainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._render_current_pixmap()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape and self._video_fullscreen:
+            self._set_video_fullscreen(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _toggle_video_fullscreen(self) -> None:
+        self._set_video_fullscreen(not self._video_fullscreen)
+
+    def _set_video_fullscreen(self, enabled: bool) -> None:
+        if self._video_fullscreen == enabled:
+            return
+
+        was_playing = self._playback_started or self.player.is_playing()
+        position_seconds = self._current_playback_seconds() if was_playing else self._playback_position_seconds
+        self._video_fullscreen = enabled
+        self.menuBar().setVisible(not enabled)
+        self.header.setVisible(not enabled)
+        self.statusBar().setVisible(not enabled)
+        if enabled:
+            self.root_layout.setContentsMargins(0, 0, 0, 0)
+            self.root_layout.setSpacing(0)
+            self.video_shell.setStyleSheet("border-radius: 0; border: 0;")
+            self.showFullScreen()
+            self._render_current_pixmap(self._fullscreen_surface_size())
+        else:
+            self.showNormal()
+            self.root_layout.setContentsMargins(18, 16, 18, 0)
+            self.root_layout.setSpacing(14)
+            self.video_shell.setStyleSheet("")
+            self._render_current_pixmap(self._display_surface_size())
+
+        self._schedule_surface_refresh(position_seconds, was_playing)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
