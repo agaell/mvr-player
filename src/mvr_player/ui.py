@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from .converter import ConversionProgress, MvrConversionError, MvrConverter
 from .player import PLAYBACK_FPS, FfmpegNotFoundError, MvrPlayer, MvrPlayerError, PlayerFileError, VideoFrame
-from .settings import APP_NAME, APP_VERSION, DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE
+from .settings import APP_ICON_FILES, APP_NAME, APP_VERSION, DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE
 
 UI_BUILD = f"qt-playback-{APP_VERSION}"
 
@@ -43,8 +43,11 @@ class QtMvrPlayerApp:
         self.app = QApplication.instance() or QApplication(sys.argv)
         self.app.setApplicationName(APP_NAME)
         self.app.setApplicationVersion(APP_VERSION)
+        self.app_icon = _load_app_icon()
+        if self.app_icon is not None:
+            self.app.setWindowIcon(self.app_icon)
 
-        self.window = MvrPlayerMainWindow()
+        self.window = MvrPlayerMainWindow(app_icon=self.app_icon)
         if initial_file is not None:
             QTimer.singleShot(250, lambda: self.window.open_file(initial_file))
 
@@ -57,8 +60,9 @@ class QtMvrPlayerApp:
 class MvrPlayerMainWindow(QMainWindow):
     """Main Qt window with embedded frame playback."""
 
-    def __init__(self) -> None:
+    def __init__(self, app_icon: QIcon | None = None) -> None:
         super().__init__()
+        self.app_icon = app_icon
         self.player = MvrPlayer()
         self.converter = MvrConverter()
         self.selected_file: Path | None = None
@@ -107,6 +111,8 @@ class MvrPlayerMainWindow(QMainWindow):
 
     def _configure_window(self) -> None:
         self.setWindowTitle(APP_NAME)
+        if self.app_icon is not None:
+            self.setWindowIcon(self.app_icon)
         width, height = _parse_geometry(DEFAULT_WINDOW_SIZE, fallback=(960, 600))
         self.resize(width, height)
         self.setMinimumSize(QSize(*MIN_WINDOW_SIZE))
@@ -1222,6 +1228,16 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def _load_app_icon() -> QIcon | None:
+    icon = QIcon()
+    for path in APP_ICON_FILES:
+        if path.exists():
+            icon.addFile(str(path))
+    if icon.isNull():
+        return None
+    return icon
 
 
 def create_main_window(initial_file: str | Path | None = None) -> QtMvrPlayerApp:
