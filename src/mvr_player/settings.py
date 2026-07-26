@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,7 +12,15 @@ APP_VERSION = "0.1.0"
 DEFAULT_WINDOW_SIZE = "960x600"
 MIN_WINDOW_SIZE = (760, 480)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _resource_root() -> Path:
+    """Return the project folder or PyInstaller's unpacked resource folder."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root is not None:
+        return Path(bundle_root)
+    return Path(__file__).resolve().parents[2]
+
+
+PROJECT_ROOT = _resource_root()
 ASSETS_DIR = PROJECT_ROOT / "assets"
 USER_DATA_DIR = Path.home() / ".mvr-player"
 USER_SETTINGS_FILE = USER_DATA_DIR / "settings.json"

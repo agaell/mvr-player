@@ -205,9 +205,6 @@ class MvrPlayerMainWindow(QMainWindow):
         self.exit_action = QAction("Выход", self)
         self.exit_action.triggered.connect(self.close)
 
-        self.reset_view_action = QAction("Сбросить вид", self)
-        self.reset_view_action.triggered.connect(self._reset_view)
-
         self.about_action = QAction("О программе", self)
         self.about_action.triggered.connect(self._show_about)
 
@@ -219,9 +216,6 @@ class MvrPlayerMainWindow(QMainWindow):
         file_menu.addAction(self.convert_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
-
-        view_menu = menu_bar.addMenu("Вид")
-        view_menu.addAction(self.reset_view_action)
 
         help_menu = menu_bar.addMenu("Справка")
         help_menu.addAction(self.about_action)
@@ -1472,14 +1466,6 @@ class MvrPlayerMainWindow(QMainWindow):
             parts.append(f"обработано {_format_duration(progress.out_time_seconds)} видео")
 
         self.statusBar().showMessage(f"Конвертация в MP4... {', '.join(parts)}")
-
-    def _reset_view(self) -> None:
-        if self._last_pixmap is not None:
-            self._render_current_pixmap()
-            self.video_stack.setCurrentWidget(self.video_label)
-        else:
-            self._show_empty_state()
-        self.statusBar().showMessage("Вид сброшен")
 
     def _show_about(self) -> None:
         QMessageBox.information(
