@@ -66,6 +66,31 @@ class ImportTests(unittest.TestCase):
                 },
             )
 
+    def test_folder_scan_finds_mvr_files_in_subdirectories(self) -> None:
+        from mvr_player.ui import _find_mvr_files
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            nested_directory = root / "recordings" / "night"
+            nested_directory.mkdir(parents=True)
+            (root / "camera-a.mvr").touch()
+            (nested_directory / "camera-b.MVR").touch()
+            (nested_directory / "notes.txt").touch()
+
+            files, skipped_directories = _find_mvr_files(root)
+
+            self.assertEqual(files, [root / "camera-a.mvr", nested_directory / "camera-b.MVR"])
+            self.assertEqual(skipped_directories, 0)
+
+    def test_file_count_uses_russian_plural_forms(self) -> None:
+        from mvr_player.ui import _format_file_count
+
+        self.assertEqual(_format_file_count(1), "1 файл")
+        self.assertEqual(_format_file_count(2), "2 файла")
+        self.assertEqual(_format_file_count(5), "5 файлов")
+        self.assertEqual(_format_file_count(11), "11 файлов")
+        self.assertEqual(_format_file_count(21), "21 файл")
+
 
 if __name__ == "__main__":
     unittest.main()

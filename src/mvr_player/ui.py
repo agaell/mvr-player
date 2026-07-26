@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import sys
 import threading
@@ -12,6 +13,7 @@ from PySide6.QtCore import QEvent, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -25,6 +27,10 @@ from PySide6.QtWidgets import (
     QSlider,
     QStackedLayout,
     QStatusBar,
+    QSplitter,
+    QStyle,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +50,38 @@ from .settings import (
 UI_BUILD = f"qt-playback-{APP_VERSION}"
 
 
+class OpenPathDialog(QFileDialog):
+    """Single chooser for an existing video file or directory."""
+
+    def __init__(self, parent: QWidget, initial_directory: Path) -> None:
+        super().__init__(parent, "Открыть", str(initial_directory))
+        self.selected_path: Path | None = None
+        self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        self.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+        self.setFileMode(QFileDialog.FileMode.AnyFile)
+        self.setNameFilters(("MVR-файлы (*.mvr)", "Все файлы (*)"))
+        self.setLabelText(QFileDialog.DialogLabel.FileName, "Файл или папка:")
+        self.setLabelText(QFileDialog.DialogLabel.Accept, "Открыть")
+
+    def accept(self) -> None:
+        selected_files = self.selectedFiles()
+        if not selected_files:
+            return
+
+        try:
+            selected_path = Path(selected_files[0]).expanduser().resolve()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            QMessageBox.warning(self, "Не удалось открыть", "Проверьте выбранный путь.")
+            return
+
+        if not selected_path.exists():
+            QMessageBox.warning(self, "Не удалось открыть", "Выбранный файл или папка не найдены.")
+            return
+
+        self.selected_path = selected_path
+        QDialog.accept(self)
+
+
 class QtMvrPlayerApp:
     """Small wrapper that owns the QApplication instance."""
 
@@ -59,7 +97,7 @@ class QtMvrPlayerApp:
         self.window = MvrPlayerMainWindow(app_icon=self.app_icon)
         self._install_exception_hooks()
         if initial_file is not None:
-            QTimer.singleShot(250, lambda: self.window.open_file(initial_file))
+            QTimer.singleShot(250, lambda: self.window.open_path(initial_file))
 
     def run(self) -> None:
         """Show the main window and start the Qt event loop."""
@@ -101,6 +139,13 @@ class MvrPlayerMainWindow(QMainWindow):
         self._seek_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
         self._conversion_generation = 0
         self._conversion_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
+        self._library_generation = 0
+        self._library_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
+        self._library_root: Path | None = None
+        self._library_available = False
+        self._library_warn_if_empty = False
+        self._library_select_path: Path | None = None
+        self._library_file_items: dict[Path, QTreeWidgetItem] = {}
         self._conversion_in_progress = False
         self._conversion_started_at = 0.0
         self._latest_conversion_progress: ConversionProgress | None = None
@@ -149,11 +194,12 @@ class MvrPlayerMainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
     def _create_actions(self) -> None:
-        self.open_action = QAction("Открыть MVR...", self)
+        self.open_action = QAction("Открыть", self)
         self.open_action.triggered.connect(self.open_dialog)
 
         self.convert_action = QAction("Конвертировать в MP4...", self)
         self.convert_action.setEnabled(False)
+        self.convert_action.setVisible(False)
         self.convert_action.triggered.connect(self._convert_to_mp4)
 
         self.exit_action = QAction("Выход", self)
@@ -186,48 +232,10 @@ class MvrPlayerMainWindow(QMainWindow):
         root = QWidget(self)
         root.setObjectName("Root")
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(18, 16, 18, 0)
-        root_layout.setSpacing(14)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
         self.root_layout = root_layout
         self.setCentralWidget(root)
-
-        self.header = QFrame(root)
-        self.header.setObjectName("Header")
-        header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(18, 14, 18, 14)
-        header_layout.setSpacing(10)
-
-        title_box = QWidget(self.header)
-        title_layout = QVBoxLayout(title_box)
-        title_layout.setContentsMargins(0, 0, 14, 0)
-        title_layout.setSpacing(2)
-
-        self.title_label = QLabel(APP_NAME, title_box)
-        self.title_label.setObjectName("TitleLabel")
-        self.version_label = QLabel(f"Интерфейс {APP_VERSION}", title_box)
-        self.version_label.setObjectName("VersionLabel")
-        title_layout.addWidget(self.title_label)
-        title_layout.addWidget(self.version_label)
-
-        self.open_button = QPushButton("Открыть MVR", self.header)
-        self.open_button.setObjectName("PrimaryButton")
-        self.open_button.clicked.connect(self.open_dialog)
-
-        self.convert_button = QPushButton("Конвертировать в MP4", self.header)
-        self.convert_button.setObjectName("SecondaryButton")
-        self.convert_button.setEnabled(False)
-        self.convert_button.clicked.connect(self._convert_to_mp4)
-
-        self.file_label = QLabel("Файл не выбран", self.header)
-        self.file_label.setObjectName("FileLabel")
-        self.file_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.file_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-
-        header_layout.addWidget(title_box)
-        header_layout.addWidget(self.open_button)
-        header_layout.addWidget(self.convert_button)
-        header_layout.addWidget(self.file_label, 1)
-        root_layout.addWidget(self.header)
 
         self.video_shell = QFrame(root)
         self.video_shell.setObjectName("VideoShell")
@@ -244,17 +252,20 @@ class MvrPlayerMainWindow(QMainWindow):
         empty_layout.setSpacing(12)
         empty_layout.addStretch(1)
 
-        self.empty_title = QLabel("Перетащите или откройте файл", self.empty_view)
+        self.empty_title = QLabel("Перетащите файл или откройте папку", self.empty_view)
         self.empty_title.setObjectName("EmptyTitle")
         self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_title.setWordWrap(True)
 
-        self.empty_hint = QLabel("Поддерживаются MVR-файлы. Также можно выбрать любой файл через меню.", self.empty_view)
+        self.empty_hint = QLabel(
+            "Выберите MVR-файл или папку, чтобы увидеть все записи в ней.",
+            self.empty_view,
+        )
         self.empty_hint.setObjectName("EmptyHint")
         self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_hint.setWordWrap(True)
 
-        self.empty_button = QPushButton("Открыть файл", self.empty_view)
+        self.empty_button = QPushButton("Открыть", self.empty_view)
         self.empty_button.setObjectName("LargeOpenButton")
         self.empty_button.clicked.connect(self.open_dialog)
 
@@ -273,7 +284,44 @@ class MvrPlayerMainWindow(QMainWindow):
 
         self.video_stack.addWidget(self.empty_view)
         self.video_stack.addWidget(self.video_label)
-        root_layout.addWidget(self.video_shell, 1)
+
+        self.library_panel = QFrame(root)
+        self.library_panel.setObjectName("LibraryPanel")
+        self.library_panel.setMinimumWidth(230)
+        self.library_panel.setMaximumWidth(360)
+        library_layout = QVBoxLayout(self.library_panel)
+        library_layout.setContentsMargins(14, 14, 14, 14)
+        library_layout.setSpacing(7)
+
+        self.library_title = QLabel("Файлы MVR", self.library_panel)
+        self.library_title.setObjectName("LibraryTitle")
+
+        self.library_count_label = QLabel("", self.library_panel)
+        self.library_count_label.setObjectName("LibraryCount")
+
+        self.file_tree = QTreeWidget(self.library_panel)
+        self.file_tree.setObjectName("FileTree")
+        self.file_tree.setHeaderHidden(True)
+        self.file_tree.setRootIsDecorated(False)
+        self.file_tree.setUniformRowHeights(True)
+        self.file_tree.setAnimated(False)
+        self.file_tree.itemClicked.connect(self._open_tree_item)
+        self.file_tree.itemActivated.connect(self._open_tree_item)
+
+        library_layout.addWidget(self.library_title)
+        library_layout.addWidget(self.library_count_label)
+        library_layout.addWidget(self.file_tree, 1)
+
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal, root)
+        self.workspace_splitter.setObjectName("WorkspaceSplitter")
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.addWidget(self.video_shell)
+        self.workspace_splitter.addWidget(self.library_panel)
+        self.workspace_splitter.setStretchFactor(0, 1)
+        self.workspace_splitter.setStretchFactor(1, 0)
+        self.workspace_splitter.setSizes([700, 280])
+        self.library_panel.hide()
+        root_layout.addWidget(self.workspace_splitter, 1)
 
         self.playback_controls = QFrame(root)
         self.playback_controls.setObjectName("PlaybackControls")
@@ -310,11 +358,18 @@ class MvrPlayerMainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_playback)
 
+        self.convert_button = QPushButton("Конвертировать в MP4", self.playback_controls)
+        self.convert_button.setObjectName("SecondaryButton")
+        self.convert_button.setEnabled(False)
+        self.convert_button.setVisible(False)
+        self.convert_button.clicked.connect(self._convert_to_mp4)
+
         playback_layout.addWidget(self.current_time_label)
         playback_layout.addWidget(self.playback_slider, 1)
         playback_layout.addWidget(self.duration_time_label)
         playback_layout.addWidget(self.play_button)
         playback_layout.addWidget(self.stop_button)
+        playback_layout.addWidget(self.convert_button)
         root_layout.addWidget(self.playback_controls)
         self._install_drop_handlers(root)
 
@@ -327,7 +382,7 @@ class MvrPlayerMainWindow(QMainWindow):
         self.conversion_progress_bar.setTextVisible(False)
         self.conversion_progress_bar.hide()
         self.statusBar().addPermanentWidget(self.conversion_progress_bar)
-        self.statusBar().showMessage(f"Готово - {UI_BUILD}")
+        self.statusBar().showMessage("Готово")
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -345,25 +400,17 @@ class MvrPlayerMainWindow(QMainWindow):
             QMenuBar::item:selected,
             QMenu::item:selected {
                 background: #e8eef8;
+                color: #111827;
             }
             QMenu {
                 background: #ffffff;
+                color: #111827;
                 border: 1px solid #d7dde8;
                 padding: 4px;
             }
-            QFrame#Header {
-                background: #ffffff;
-                border: 1px solid #dce3ee;
-                border-radius: 8px;
-            }
-            QLabel#TitleLabel {
-                font-size: 18px;
-                font-weight: 700;
-                color: #0f172a;
-            }
-            QLabel#VersionLabel,
-            QLabel#FileLabel {
-                color: #64748b;
+            QMenu::item {
+                color: #111827;
+                background: transparent;
             }
             QPushButton {
                 min-height: 34px;
@@ -404,12 +451,48 @@ class MvrPlayerMainWindow(QMainWindow):
             }
             QFrame#VideoShell {
                 background: #05070b;
-                border: 1px solid #111827;
-                border-radius: 8px;
+                border: 0;
+                border-radius: 0;
+            }
+            QFrame#LibraryPanel {
+                background: #ffffff;
+                border: 0;
+                border-left: 1px solid #dce3ee;
+                border-radius: 0;
+            }
+            QLabel#LibraryTitle {
+                color: #0f172a;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QLabel#LibraryCount {
+                color: #64748b;
+                font-size: 12px;
+            }
+            QTreeWidget#FileTree {
+                border: 1px solid #dce3ee;
+                border-radius: 6px;
+                background: #f8fafc;
+                color: #1e293b;
+                padding: 4px;
+            }
+            QTreeWidget#FileTree::item {
+                min-height: 24px;
+                border-radius: 4px;
+                padding: 1px 4px;
+            }
+            QTreeWidget#FileTree::item:hover,
+            QTreeWidget#FileTree::item:selected {
+                background: #dbeafe;
+                color: #0f3f93;
+            }
+            QSplitter#WorkspaceSplitter::handle {
+                width: 8px;
+                background: transparent;
             }
             QWidget#EmptyView {
                 background: #05070b;
-                border-radius: 8px;
+                border-radius: 0;
             }
             QLabel#EmptyTitle {
                 color: #f8fafc;
@@ -422,12 +505,13 @@ class MvrPlayerMainWindow(QMainWindow):
             }
             QLabel#VideoLabel {
                 background: #000000;
-                border-radius: 8px;
+                border-radius: 0;
             }
             QFrame#PlaybackControls {
                 background: #ffffff;
-                border: 1px solid #dce3ee;
-                border-radius: 8px;
+                border: 0;
+                border-top: 1px solid #dce3ee;
+                border-radius: 0;
             }
             QLabel#TimeLabel {
                 color: #334155;
@@ -494,25 +578,202 @@ class MvrPlayerMainWindow(QMainWindow):
 
     def open_dialog(self) -> None:
         initial_directory = self.user_settings.last_open_directory or Path.home()
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Открыть MVR",
-            str(initial_directory),
-            "MVR-файлы (*.mvr);;Все файлы (*)",
-        )
-        if filename:
-            self.open_file(filename)
+        dialog = OpenPathDialog(self, initial_directory)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_path is not None:
+            self.open_path(dialog.selected_path)
 
-    def open_file(self, file_path: str | Path) -> None:
+    def open_path(self, path: str | Path) -> None:
+        """Open a video file or scan a selected directory."""
+        if self._conversion_in_progress:
+            self.statusBar().showMessage("Дождитесь завершения конвертации")
+            return
+
         try:
-            path = Path(file_path).expanduser()
+            candidate = Path(path).expanduser()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.statusBar().showMessage("Не удалось открыть путь")
+            self.show_error("Не удалось открыть путь", user_message(exc, "Проверьте выбранный путь."))
+            return
+
+        if candidate.is_dir():
+            self.open_folder(candidate)
+            return
+        self.open_file(candidate)
+
+    def open_folder(self, folder_path: str | Path) -> None:
+        """Scan a folder in the background and display its MVR files."""
+        try:
+            root = Path(folder_path).expanduser().resolve()
+            if not root.exists():
+                raise PlayerFileError(f"Папка не найдена: {root}")
+            if not root.is_dir():
+                raise PlayerFileError(f"Выбранный путь не является папкой: {root}")
+        except (OSError, RuntimeError, TypeError, ValueError, PlayerFileError) as exc:
+            self.statusBar().showMessage("Не удалось открыть папку")
+            self.show_error(
+                "Не удалось открыть папку",
+                user_message(exc, "Проверьте выбранную папку и попробуйте снова."),
+                details=self._error_details(exc),
+                icon=QMessageBox.Icon.Warning,
+            )
+            return
+
+        self.user_settings.remember_open_directory(root)
+        self._scan_library_folder(root, warn_if_empty=True)
+
+    def _scan_library_folder(
+        self,
+        root: Path,
+        selected_file: Path | None = None,
+        *,
+        warn_if_empty: bool = False,
+    ) -> None:
+        self._library_generation += 1
+        generation = self._library_generation
+        self._library_root = root
+        self._library_available = True
+        self._library_warn_if_empty = warn_if_empty
+        self.library_panel.setVisible(not self._video_fullscreen)
+        self._library_select_path = selected_file
+        self._library_file_items.clear()
+        self.file_tree.clear()
+        self.file_tree.setEnabled(False)
+        self.library_count_label.setText("Поиск файлов...")
+        self.statusBar().showMessage("Ищу MVR-файлы...")
+
+        threading.Thread(
+            target=self._scan_library_folder_worker,
+            args=(generation, root),
+            daemon=True,
+        ).start()
+
+    def _scan_library_folder_worker(self, generation: int, root: Path) -> None:
+        try:
+            files, skipped_directories = _find_mvr_files(root)
+        except Exception as exc:
+            log_exception("Unexpected error while scanning MVR folder", exc)
+            self._library_events.put(("error", generation, UserFacingError("Не удалось прочитать папку.", traceback_text(exc))))
+            return
+
+        self._library_events.put(("ready", generation, (root, files, skipped_directories)))
+
+    def _pump_library_events(self) -> None:
+        while True:
+            try:
+                event_name, generation, payload = self._library_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if generation != self._library_generation or self._closing:
+                continue
+            if event_name == "ready":
+                root, files, skipped_directories = payload
+                self._populate_file_tree(root, files, skipped_directories)
+            elif event_name == "error":
+                self.file_tree.setEnabled(not self._conversion_in_progress)
+                self.library_count_label.setText("Не удалось прочитать папку")
+                self.statusBar().showMessage("Не удалось прочитать папку")
+                self.show_error(
+                    "Файлы MVR",
+                    user_message(payload, "Не удалось прочитать папку."),
+                    details=self._error_details(payload),
+                    icon=QMessageBox.Icon.Warning,
+                )
+
+    def _populate_file_tree(self, root: Path, files: list[Path], skipped_directories: int) -> None:
+        self.file_tree.clear()
+        self._library_file_items.clear()
+        self.file_tree.setEnabled(not self._conversion_in_progress)
+
+        if not files:
+            empty_item = QTreeWidgetItem(["MVR-файлы не найдены"])
+            empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.file_tree.addTopLevelItem(empty_item)
+            self.library_count_label.setText("Нет файлов")
+            self.statusBar().showMessage("MVR-файлы не найдены")
+            if self._library_warn_if_empty:
+                self._library_warn_if_empty = False
+                self.show_error(
+                    "В папке нет MVR-файлов",
+                    "Выбранная папка и её подпапки не содержат файлов .mvr.",
+                    icon=QMessageBox.Icon.Warning,
+                )
+            return
+
+        directory_items: dict[Path, QTreeWidgetItem] = {}
+        root_item = self.file_tree.invisibleRootItem()
+        folder_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        file_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
+        for file_path in files:
+            parent_item = root_item
+            current_directory = root
+            for directory_name in file_path.parent.relative_to(root).parts:
+                current_directory = current_directory / directory_name
+                directory_item = directory_items.get(current_directory)
+                if directory_item is None:
+                    directory_item = QTreeWidgetItem([directory_name])
+                    directory_item.setIcon(0, folder_icon)
+                    directory_item.setFlags(directory_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                    parent_item.addChild(directory_item)
+                    directory_items[current_directory] = directory_item
+                parent_item = directory_item
+
+            file_item = QTreeWidgetItem([file_path.name])
+            file_item.setIcon(0, file_icon)
+            file_item.setData(0, Qt.ItemDataRole.UserRole, str(file_path))
+            file_item.setToolTip(0, str(file_path))
+            parent_item.addChild(file_item)
+            self._library_file_items[file_path] = file_item
+
+        for item in directory_items.values():
+            item.setExpanded(True)
+
+        self.library_count_label.setText(_format_file_count(len(files)))
+        if skipped_directories:
+            self.statusBar().showMessage(
+                f"Найдено: {_format_file_count(len(files))}. Некоторые папки недоступны"
+            )
+        else:
+            self.statusBar().showMessage(f"Найдено: {_format_file_count(len(files))}")
+        self._select_library_file(self._library_select_path)
+
+    def _open_tree_item(self, item: QTreeWidgetItem, column: int) -> None:
+        file_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(file_path, str) and file_path:
+            self.open_file(file_path, refresh_library=False)
+
+    def _select_library_file(self, path: Path | None) -> None:
+        if path is None:
+            return
+        item = self._library_file_items.get(path)
+        if item is None:
+            return
+        self.file_tree.setCurrentItem(item)
+        self.file_tree.scrollToItem(item)
+
+    def _update_library_for_file(self, path: Path) -> None:
+        if self._library_root is not None:
+            try:
+                path.relative_to(self._library_root)
+            except ValueError:
+                pass
+            else:
+                self._select_library_file(path)
+                return
+
+        self._scan_library_folder(path.parent, selected_file=path)
+
+    def open_file(self, file_path: str | Path, *, refresh_library: bool = True) -> None:
+        try:
+            path = Path(file_path).expanduser().resolve()
             if not path.exists():
                 raise PlayerFileError(f"Файл не найден: {path}")
             if not path.is_file():
                 raise PlayerFileError(f"Выбранный путь не является файлом: {path}")
             if path.stat().st_size <= 0:
                 raise PlayerFileError(f"Файл пустой: {path}")
-        except (OSError, RuntimeError, PlayerFileError) as exc:
+        except (OSError, RuntimeError, TypeError, ValueError, PlayerFileError) as exc:
             self.statusBar().showMessage("Не удалось открыть файл")
             self.show_error(
                 "Не удалось открыть файл",
@@ -523,6 +784,10 @@ class MvrPlayerMainWindow(QMainWindow):
             return
 
         self.user_settings.remember_open_directory(path.parent)
+        if refresh_library:
+            self._update_library_for_file(path)
+        else:
+            self._select_library_file(path)
         self._load_generation += 1
         generation = self._load_generation
 
@@ -536,13 +801,12 @@ class MvrPlayerMainWindow(QMainWindow):
         self._last_pixmap = None
         self._preview_image = None
 
-        self.file_label.setText(path.name)
+        self.setWindowTitle(f"{path.name} - {APP_NAME}")
         self._show_empty_state(
-            "Загрузка видео...",
-            f"{path.name}\nГотовлю первый кадр через FFmpeg",
-            "Открыть другой файл",
+            "Загрузка...",
+            "",
         )
-        self.statusBar().showMessage(f"Файл выбран: {path}")
+        self.statusBar().showMessage(f"Открываю: {path.name}")
         QApplication.processEvents()
 
         size = self._video_surface_size()
@@ -603,6 +867,7 @@ class MvrPlayerMainWindow(QMainWindow):
 
         self._pump_conversion_events()
         self._pump_seek_events()
+        self._pump_library_events()
 
     def _on_preview_ready(
         self,
@@ -619,8 +884,8 @@ class MvrPlayerMainWindow(QMainWindow):
         self.selected_file = path
         self._update_playback_progress(0)
         self._set_file_controls_enabled(True)
-        self.file_label.setText(path.name)
-        self.statusBar().showMessage("Первый кадр показан. Запускаю воспроизведение...")
+        self.setWindowTitle(f"{path.name} - {APP_NAME}")
+        self.statusBar().showMessage(f"Открыто: {path.name}")
         self._display_frame(preview)
         QTimer.singleShot(120, lambda: self.play() if generation == self._load_generation else None)
 
@@ -636,11 +901,10 @@ class MvrPlayerMainWindow(QMainWindow):
         self.player.stop()
         self._reset_playback_progress()
         self._set_file_controls_enabled(False)
-        self.file_label.setText("Файл не выбран")
+        self.setWindowTitle(APP_NAME)
         self._show_empty_state(
             "Видео не прочитано",
             message,
-            "Открыть другой файл",
         )
         self.statusBar().showMessage("Не удалось получить первый кадр")
         self.show_error(
@@ -695,7 +959,7 @@ class MvrPlayerMainWindow(QMainWindow):
         self._playback_position_seconds = start_seconds
         self._update_playback_progress(start_seconds)
         self._set_playback_controls(True)
-        self.statusBar().showMessage(f"Воспроизведение: {self.selected_file}")
+        self.statusBar().showMessage(f"Воспроизведение: {self.selected_file.name}")
         self.frame_timer.start()
 
     def pause_playback(self) -> None:
@@ -729,7 +993,7 @@ class MvrPlayerMainWindow(QMainWindow):
             self.statusBar().showMessage("Файл не выбран")
             return
 
-        self.statusBar().showMessage(f"Воспроизведение остановлено: {self.selected_file}")
+        self.statusBar().showMessage(f"Воспроизведение остановлено: {self.selected_file.name}")
         if reset_preview:
             self._seek_to_seconds(0.0)
 
@@ -760,10 +1024,13 @@ class MvrPlayerMainWindow(QMainWindow):
             return
 
         details = self.player.last_error
-        message = "FFmpeg завершился с ошибкой."
+        message = "Не удалось продолжить воспроизведение."
         if details:
             message = user_message(details, message)
-        self._show_empty_state("Не удалось воспроизвести файл", "Проверьте формат файла и FFmpeg", "Открыть другой файл")
+        self._show_empty_state(
+            "Не удалось воспроизвести файл",
+            "Файл повреждён или имеет неподдерживаемый формат.",
+        )
         self.statusBar().showMessage("Воспроизведение завершилось с ошибкой")
         self.show_error("Ошибка воспроизведения", message, details=details)
 
@@ -801,13 +1068,13 @@ class MvrPlayerMainWindow(QMainWindow):
 
     def _show_empty_state(
         self,
-        title: str = "Перетащите или откройте файл",
-        hint: str = "Поддерживаются MVR-файлы. Также можно выбрать любой файл через меню.",
-        button_text: str = "Открыть файл",
+        title: str = "Перетащите файл или откройте папку",
+        hint: str = "Выберите MVR-файл или папку с записями.",
     ) -> None:
         self.empty_title.setText(title)
         self.empty_hint.setText(hint)
-        self.empty_button.setText(button_text)
+        self.empty_hint.setVisible(bool(hint.strip()))
+        self.empty_button.setText("Открыть")
         self.video_label.clear()
         self.video_stack.setCurrentWidget(self.empty_view)
 
@@ -1009,6 +1276,7 @@ class MvrPlayerMainWindow(QMainWindow):
         )
 
     def _set_file_controls_enabled(self, enabled: bool) -> None:
+        self._set_conversion_controls_available(enabled)
         if self._conversion_in_progress:
             self.play_button.setText("Play")
             self.stop_button.setText("Stop")
@@ -1028,6 +1296,8 @@ class MvrPlayerMainWindow(QMainWindow):
         self.playback_slider.setEnabled(enabled and self._duration_seconds is not None)
 
     def _set_playback_controls(self, is_playing: bool) -> None:
+        has_file = self.selected_file is not None
+        self._set_conversion_controls_available(has_file)
         if self._conversion_in_progress:
             self.play_button.setText("Play")
             self.stop_button.setText("Stop")
@@ -1038,7 +1308,6 @@ class MvrPlayerMainWindow(QMainWindow):
             self.playback_slider.setEnabled(False)
             return
 
-        has_file = self.selected_file is not None
         self.play_button.setText("Pause" if is_playing else "Play")
         self.stop_button.setText("Stop")
         self.play_button.setEnabled(has_file)
@@ -1046,6 +1315,10 @@ class MvrPlayerMainWindow(QMainWindow):
         self.convert_button.setEnabled(self.selected_file is not None)
         self.convert_action.setEnabled(self.selected_file is not None)
         self.playback_slider.setEnabled(self.selected_file is not None and self._duration_seconds is not None)
+
+    def _set_conversion_controls_available(self, available: bool) -> None:
+        self.convert_action.setVisible(available)
+        self.convert_button.setVisible(available and not self._video_fullscreen)
 
     def _handle_play_error(
         self,
@@ -1058,7 +1331,7 @@ class MvrPlayerMainWindow(QMainWindow):
         message = user_message(message, message)
         self._set_playback_controls(False)
         self.statusBar().showMessage(title)
-        self._show_empty_state("Видео не запущено", message, "Открыть другой файл")
+        self._show_empty_state("Видео не запущено", message)
         self.show_error("Не удалось воспроизвести файл", message, details=details, log_hint=log_hint)
 
     def _convert_to_mp4(self) -> None:
@@ -1161,8 +1434,8 @@ class MvrPlayerMainWindow(QMainWindow):
     def _set_conversion_busy(self, busy: bool) -> None:
         self._conversion_in_progress = busy
         self.open_action.setEnabled(not busy)
-        self.open_button.setEnabled(not busy)
         self.empty_button.setEnabled(not busy)
+        self.file_tree.setEnabled(not busy)
         self.convert_button.setText("Конвертация..." if busy else "Конвертировать в MP4")
 
         if busy:
@@ -1191,16 +1464,12 @@ class MvrPlayerMainWindow(QMainWindow):
         elapsed = _format_duration(time.monotonic() - self._conversion_started_at)
         progress = self._latest_conversion_progress
         if progress is None:
-            self.statusBar().showMessage(f"Конвертация в MP4... прошло {elapsed}. Запуск FFmpeg")
+            self.statusBar().showMessage(f"Подготовка MP4... прошло {elapsed}")
             return
 
         parts = [f"прошло {elapsed}"]
         if progress.out_time_seconds > 0:
             parts.append(f"обработано {_format_duration(progress.out_time_seconds)} видео")
-        if progress.frame > 0:
-            parts.append(f"кадр {progress.frame}")
-        if progress.speed:
-            parts.append(f"скорость {progress.speed}")
 
         self.statusBar().showMessage(f"Конвертация в MP4... {', '.join(parts)}")
 
@@ -1219,8 +1488,7 @@ class MvrPlayerMainWindow(QMainWindow):
             (
                 f"{APP_NAME}\n\n"
                 f"Версия: {APP_VERSION}\n"
-                f"Интерфейс: {UI_BUILD}\n\n"
-                "Приложение для просмотра .mvr файлов и будущей конвертации в .mp4."
+                "\nПросмотр MVR-файлов и сохранение видео в формате MP4."
             ),
         )
 
@@ -1370,19 +1638,18 @@ class MvrPlayerMainWindow(QMainWindow):
         position_seconds = self._current_playback_seconds() if was_playing else self._playback_position_seconds
         self._video_fullscreen = enabled
         self.menuBar().setVisible(not enabled)
-        self.header.setVisible(not enabled)
+        self.library_panel.setVisible(self._library_available and not enabled)
+        self._set_conversion_controls_available(self.selected_file is not None)
         self.statusBar().setVisible(not enabled)
         if enabled:
             self.root_layout.setContentsMargins(0, 0, 0, 0)
             self.root_layout.setSpacing(0)
-            self.video_shell.setStyleSheet("border-radius: 0; border: 0;")
             self.showFullScreen()
             self._render_current_pixmap(self._fullscreen_surface_size())
         else:
             self.showNormal()
-            self.root_layout.setContentsMargins(18, 16, 18, 0)
-            self.root_layout.setSpacing(14)
-            self.video_shell.setStyleSheet("")
+            self.root_layout.setContentsMargins(0, 0, 0, 0)
+            self.root_layout.setSpacing(0)
             self._render_current_pixmap(self._display_surface_size())
 
         self._schedule_surface_refresh(position_seconds, was_playing)
@@ -1397,10 +1664,15 @@ class MvrPlayerMainWindow(QMainWindow):
         self._handle_drop_event(event)
 
     def _handle_drop_event(self, event) -> bool:
+        if self._conversion_in_progress:
+            self.statusBar().showMessage("Дождитесь завершения конвертации")
+            event.ignore()
+            return True
+
         urls = event.mimeData().urls()
         for url in urls:
             if url.isLocalFile():
-                self.open_file(url.toLocalFile())
+                self.open_path(url.toLocalFile())
                 event.acceptProposedAction()
                 return True
         event.ignore()
@@ -1431,6 +1703,37 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def _format_file_count(count: int) -> str:
+    count = max(0, count)
+    last_two_digits = count % 100
+    last_digit = count % 10
+    if last_digit == 1 and last_two_digits != 11:
+        word = "файл"
+    elif last_digit in (2, 3, 4) and last_two_digits not in (12, 13, 14):
+        word = "файла"
+    else:
+        word = "файлов"
+    return f"{count} {word}"
+
+
+def _find_mvr_files(root: Path) -> tuple[list[Path], int]:
+    """Return MVR files below *root* and count unreadable directories."""
+    files: list[Path] = []
+    skipped_directories = 0
+
+    def on_error(_error: OSError) -> None:
+        nonlocal skipped_directories
+        skipped_directories += 1
+
+    for current_directory, directory_names, file_names in os.walk(root, onerror=on_error):
+        directory_names.sort(key=str.casefold)
+        for file_name in sorted(file_names, key=str.casefold):
+            if file_name.lower().endswith(".mvr"):
+                files.append(Path(current_directory) / file_name)
+
+    return files, skipped_directories
 
 
 def _load_app_icon() -> QIcon | None:
