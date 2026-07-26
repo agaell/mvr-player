@@ -1,6 +1,9 @@
 """Import smoke tests for the project skeleton."""
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 
 class ImportTests(unittest.TestCase):
@@ -36,6 +39,32 @@ class ImportTests(unittest.TestCase):
 
         self.assertIn("FFmpeg", message)
         self.assertIn("файл", message)
+
+    def test_user_settings_remember_folders_outside_repository(self) -> None:
+        from mvr_player.settings import UserSettings
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            settings_file = Path(temporary_directory) / "settings.json"
+            open_directory = Path(temporary_directory) / "open"
+            output_directory = Path(temporary_directory) / "output"
+            open_directory.mkdir()
+            output_directory.mkdir()
+
+            preferences = UserSettings.load(settings_file)
+            preferences.remember_open_directory(open_directory)
+            preferences.remember_mp4_output_directory(output_directory)
+
+            restored_preferences = UserSettings.load(settings_file)
+
+            self.assertEqual(restored_preferences.last_open_directory, open_directory)
+            self.assertEqual(restored_preferences.mp4_output_directory, output_directory)
+            self.assertEqual(
+                json.loads(settings_file.read_text(encoding="utf-8")),
+                {
+                    "last_open_directory": str(open_directory),
+                    "mp4_output_directory": str(output_directory),
+                },
+            )
 
 
 if __name__ == "__main__":

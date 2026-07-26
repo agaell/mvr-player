@@ -32,7 +32,14 @@ from PySide6.QtWidgets import (
 from .converter import ConversionProgress, MvrConversionError, MvrConverter
 from .errors import LOG_FILE, UserFacingError, configure_error_logging, log_exception, traceback_text, user_message
 from .player import PLAYBACK_FPS, FfmpegNotFoundError, MvrPlayer, MvrPlayerError, PlayerFileError, VideoFrame
-from .settings import APP_ICON_FILES, APP_NAME, APP_VERSION, DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE
+from .settings import (
+    APP_ICON_FILES,
+    APP_NAME,
+    APP_VERSION,
+    DEFAULT_WINDOW_SIZE,
+    MIN_WINDOW_SIZE,
+    UserSettings,
+)
 
 UI_BUILD = f"qt-playback-{APP_VERSION}"
 
@@ -86,6 +93,7 @@ class MvrPlayerMainWindow(QMainWindow):
         self.app_icon = app_icon
         self.player = MvrPlayer()
         self.converter = MvrConverter()
+        self.user_settings = UserSettings.load()
         self.selected_file: Path | None = None
         self._load_generation = 0
         self._load_events: queue.Queue[tuple[str, int, object]] = queue.Queue()
@@ -485,10 +493,11 @@ class MvrPlayerMainWindow(QMainWindow):
         self.play_button.setText(current_text)
 
     def open_dialog(self) -> None:
+        initial_directory = self.user_settings.last_open_directory or Path.home()
         filename, _ = QFileDialog.getOpenFileName(
             self,
             "Открыть MVR",
-            str(Path.home()),
+            str(initial_directory),
             "MVR-файлы (*.mvr);;Все файлы (*)",
         )
         if filename:
@@ -513,6 +522,7 @@ class MvrPlayerMainWindow(QMainWindow):
             )
             return
 
+        self.user_settings.remember_open_directory(path.parent)
         self._load_generation += 1
         generation = self._load_generation
 
@@ -1058,7 +1068,8 @@ class MvrPlayerMainWindow(QMainWindow):
         if self._conversion_in_progress:
             return
 
-        default_output = self.selected_file.with_suffix(".mp4")
+        output_directory = self.user_settings.mp4_output_directory or self.selected_file.parent
+        default_output = output_directory / self.selected_file.with_suffix(".mp4").name
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить MP4",
@@ -1072,6 +1083,7 @@ class MvrPlayerMainWindow(QMainWindow):
         output_path = Path(filename).expanduser()
         if output_path.suffix.lower() != ".mp4":
             output_path = output_path.with_suffix(".mp4")
+        self.user_settings.remember_mp4_output_directory(output_path.parent)
 
         source_path = self.selected_file
         self.stop_playback(reset_preview=False)
